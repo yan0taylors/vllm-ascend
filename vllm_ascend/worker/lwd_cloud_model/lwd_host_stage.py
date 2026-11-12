@@ -22,12 +22,12 @@ from typing import Protocol
 
 from vllm.lwd_logger import lwd_logger
 
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId  # 【MR2】暂存层引入连接编号：seqno key 可以是 int 或 (连接, seqno)
 
-LwdStageKey = int | tuple[ConnectionId, int]
+LwdStageKey = int | tuple[ConnectionId, int]  # 【MR2】单连接仍用 int，多连接用 (连接, seqno)，两种 key 都兼容
 
 
-def _stage_sort_key(key: LwdStageKey) -> tuple[int, int, int, int]:
+def _stage_sort_key(key: LwdStageKey) -> tuple[int, int, int, int]:  # 【MR2】统一排序键：int 排在最前，元组按 (边, 云, DP, seqno)
     if isinstance(key, int):
         return (0, 0, 0, key)
     connection, seqno = key
@@ -221,7 +221,7 @@ class LwdReqEmbed:
 class LwdStagedBatch:
     """Request and source-layout metadata for one received batch."""
 
-    seqno: LwdStageKey
+    seqno: LwdStageKey  # 【MR2】批次 key 允许带连接
     req_ids: list[str]
     num_tokens_per_req: list[int]
     hidden_size: int
@@ -259,22 +259,22 @@ class LwdHostStager:
         self._device_factory = device_factory
         self._lock = threading.Lock()
         self._slot_buffers: dict[int, LwdBuffer] = {}
-        self._slot_owner: dict[int, LwdStageKey | int] = {slot: -1 for slot in range(slots)}
-        self._seqno_slot: dict[LwdStageKey, int] = {}
-        self._batches: dict[LwdStageKey, LwdStagedBatch] = {}
+        self._slot_owner: dict[int, LwdStageKey | int] = {slot: -1 for slot in range(slots)}  # 【MR2】槽位记录持有者（-1 表示空闲），取代单独的 busy 集合
+        self._seqno_slot: dict[LwdStageKey, int] = {}  # 【MR2】seqno -> 槽位映射
+        self._batches: dict[LwdStageKey, LwdStagedBatch] = {}  # 【MR2】seqno -> 批次元数据
         self._reqs: dict[str, LwdReqEmbed] = {}
-        self._req_connections: dict[str, ConnectionId] = {}
+        self._req_connections: dict[str, ConnectionId] = {}  # 【MR2】请求 -> 所属连接，用于按连接清理
         self._ended_req_ids: set[str] = set()
-        self._end_pending: dict[str, set[LwdStageKey]] = {}
-        self._end_after: dict[str, LwdStageKey] = {}
+        self._end_pending: dict[str, set[LwdStageKey]] = {}  # 【MR2】请求结束时要等的 seqno 集合
+        self._end_after: dict[str, LwdStageKey] = {}  # 【MR2】请求结束后需要越过的最大 seqno
         self._end_waiting: set[str] = set()
-        self._last_delivered: LwdStageKey = -1
-        self._batch_reqs: dict[LwdStageKey, list[str]] = {}
-        self._arrival_plan: dict[LwdStageKey, list[tuple[LwdReqEmbed, int, int]]] = {}
+        self._last_delivered: LwdStageKey = -1  # 【MR2】最后交付的 seqno（按统一排序键比较）
+        self._batch_reqs: dict[LwdStageKey, list[str]] = {}  # 【MR2】每个批次包含的请求 id
+        self._arrival_plan: dict[LwdStageKey, list[tuple[LwdReqEmbed, int, int]]] = {}  # 【MR2】每个批次的到达计划
         # (connection, req_id, prefix_nonce); connection is None for
         # single-connection (int) stage keys. Drained per connection so one
         # edge never consumes another edge's refill completion.
-        self._refill_done: list[tuple[ConnectionId | None, str, int]] = []
+        self._refill_done: list[tuple[ConnectionId | None, str, int]] = []  # 【MR2】refill 完成项带连接，取用时按连接过滤，避免边 A 取走边 B 的完成
         self._host_bytes = 0
         self._released_requests = 0
         self._aborted_requests = 0
@@ -306,9 +306,9 @@ class LwdHostStager:
 
     def busy_slots(self) -> list[int]:
         with self._lock:
-            return [slot for slot, owner in self._slot_owner.items() if owner != -1]
+            return [slot for slot, owner in self._slot_owner.items() if owner != -1]  # 【MR2】忙槽 = 有持有者的槽
 
-    def staged_seqnos(self) -> list[LwdStageKey]:
+    def staged_seqnos(self) -> list[LwdStageKey]:  # 【MR2】当前已分配但未释放的 seqno 列表
         with self._lock:
             return list(self._batches)
 
@@ -335,25 +335,25 @@ class LwdHostStager:
             req = self._reqs.get(req_id)
             return req._stage_floor if req is not None else 0
 
-    def take_refill_done(self, connection: ConnectionId | None = None) -> list[tuple[str, int]]:
+    def take_refill_done(self, connection: ConnectionId | None = None) -> list[tuple[str, int]]:  # 【MR2】按连接取 refill 完成项
         """Drain refill completions of one connection, keeping the rest."""
         with self._lock:
-            done = [(req_id, nonce) for conn, req_id, nonce in self._refill_done if conn == connection]
+            done = [(req_id, nonce) for conn, req_id, nonce in self._refill_done if conn == connection]  # 【MR2】只挑该连接的完成项
             if done:
-                self._refill_done = [item for item in self._refill_done if item[0] != connection]
+                self._refill_done = [item for item in self._refill_done if item[0] != connection]  # 【MR2】把该连接的项移除，其它连接的保留
         return done
 
-    def allocate(self, seqno: LwdStageKey, numel: int) -> tuple[LwdBuffer, int]:
+    def allocate(self, seqno: LwdStageKey, numel: int) -> tuple[LwdBuffer, int]:  # 【MR2】分配槽位，key 可以是 (连接, seqno)
         """Bind a free device slot to one receive sequence number."""
         with self._lock:
             if numel < 0 or (self.max_numel and numel > self.max_numel):
                 raise LwdHostStageGeometryError(f"seqno={seqno}: numel {numel} outside slot capacity {self.max_numel}")
             if seqno in self._seqno_slot:
                 raise LwdHostStageGeometryError(f"seqno={seqno}: receive slot is already allocated")
-            free_slots = [slot for slot, owner in self._slot_owner.items() if owner == -1]
+            free_slots = [slot for slot, owner in self._slot_owner.items() if owner == -1]  # 【MR2】按持有者为 -1 找空闲槽
             if not free_slots:
                 raise LwdHostStageSlotBusy(
-                    f"seqno={seqno}: all {self.slots} device slot(s) busy "
+                    f"seqno={seqno}: all {self.slots} device slot(s) busy "  # 【MR2】槽满时报错，并列出被哪些 seqno 占用
                     f"(held by seqno={sorted(self._seqno_slot, key=_stage_sort_key)})"
                 )
             slot = free_slots[0]
@@ -365,7 +365,7 @@ class LwdHostStager:
             self._seqno_slot[seqno] = slot
         return buf[:numel], slot
 
-    def abandon(self, seqno: LwdStageKey) -> None:
+    def abandon(self, seqno: LwdStageKey) -> None:  # 【MR2】回滚一个未真正投递的接收计划
         """Roll back a plan and allocation whose receive was never posted."""
         with self._lock:
             slot = self._seqno_slot.pop(seqno, -1)
@@ -377,33 +377,33 @@ class LwdHostStager:
             self._complete_end_plan(seqno, delivered=False)
             if batch is None:
                 return
-            abandoned_reqs = set(batch.req_ids)
+            abandoned_reqs = set(batch.req_ids)  # 【MR2】丢弃该批次请求尚未消费的 refill 完成项
             self._refill_done = [item for item in self._refill_done if item[1] not in abandoned_reqs]
             for req_id in batch.created_req_ids:
                 req = self._reqs.get(req_id)
                 if req is not None and batch.request_hosts.get(req_id) is req and req._written_hi == req._stage_floor:
                     self._reqs.pop(req_id)
-                    self._req_connections.pop(req_id, None)
+                    self._req_connections.pop(req_id, None)  # 【MR2】请求释放时同时清掉连接绑定
                     self._host_bytes -= (req.numel + req.tail_numel) * 2
 
-    def abandon_connection(self, connection: ConnectionId) -> None:
+    def abandon_connection(self, connection: ConnectionId) -> None:  # 【MR2】一条连接失败时，清掉它名下的全部暂存和交付状态
         """Drop all staged and delivered state owned by one failed peer."""
         with self._lock:
-            keys = {
+            keys = {  # 【MR2】收集该连接涉及的批次/计划/槽位 key
                 key
-                for key in (*self._batches.keys(), *self._arrival_plan.keys(), *self._seqno_slot.keys())
+                for key in (*self._batches.keys(), *self._arrival_plan.keys(), *self._seqno_slot.keys())  # 【MR2】只处理元组 key 且连接匹配的项
                 if isinstance(key, tuple) and key[0] == connection
             }
-            req_ids = {req_id for key in keys for req_id in self._batch_reqs.get(key, ())}
-            req_ids.update(req_id for req_id, owner in self._req_connections.items() if owner == connection)
+            req_ids = {req_id for key in keys for req_id in self._batch_reqs.get(key, ())}  # 【MR2】这些批次里的请求
+            req_ids.update(req_id for req_id, owner in self._req_connections.items() if owner == connection)  # 【MR2】加上 owner 就是该连接的请求
         for key in keys:
-            self.abandon(key)
-        for req_id in req_ids:
+            self.abandon(key)  # 【MR2】逐个回滚批次
+        for req_id in req_ids:  # 【MR2】再释放请求占用的 host 内存
             self.release_request(req_id)
 
     def plan_recv_segments(
         self,
-        seqno: LwdStageKey,
+        seqno: LwdStageKey,  # 【MR2】接收计划也按 seqno key 记录
         numel: int,
         hidden_size: int,
         req_ids: list[str],
@@ -456,9 +456,9 @@ class LwdHostStager:
         segments: list[tuple[LwdBuffer, int, int]] = []
         plan: list[tuple[LwdReqEmbed, int, int]] = []
         with self._lock:
-            if isinstance(seqno, tuple):
+            if isinstance(seqno, tuple):  # 【MR2】元组 key 时登记请求所属连接
                 for req_id in req_ids:
-                    self._req_connections.setdefault(req_id, seqno[0])
+                    self._req_connections.setdefault(req_id, seqno[0])  # 【MR2】setdefault：同一请求只记第一次的连接
             source_row = 0
             for index, req_id in enumerate(req_ids):
                 host: LwdReqEmbed | None = None
@@ -492,7 +492,7 @@ class LwdHostStager:
             self._batch_reqs[seqno] = list(req_ids)
             self._arrival_plan[seqno] = plan
         lwd_logger.debug(
-            "[Lwd][host-stage] PLAN seqno=%s dur=%.2fms reqs=%d rows=%d",
+            "[Lwd][host-stage] PLAN seqno=%s dur=%.2fms reqs=%d rows=%d",  # 【MR2】PLAN 日志补充 seqno，便于按连接排查
             seqno,
             (time.monotonic() - started) * 1000,
             len(req_ids),
@@ -500,9 +500,9 @@ class LwdHostStager:
         )
         return segments
 
-    def publish_received(self, seqno: LwdStageKey) -> list[tuple[str, int, int]]:
+    def publish_received(self, seqno: LwdStageKey) -> list[tuple[str, int, int]]:  # 【MR2】发布已完成的 D2H 到达行
         """Publish active D2H arrivals and release the receive slot."""
-        connection = seqno[0] if isinstance(seqno, tuple) else None
+        connection = seqno[0] if isinstance(seqno, tuple) else None  # 【MR2】从 key 里取连接；单连接 int key 为 None
         with self._lock:
             plan = self._arrival_plan.pop(seqno, None)
             if plan is None:
@@ -518,17 +518,17 @@ class LwdHostStager:
                     host._refill_lo = None
                     host._refill_hi = None
                     host._refill_completed = False
-                    self._refill_done.append((connection, host.req_id, host.prefix_nonce))
+                    self._refill_done.append((connection, host.req_id, host.prefix_nonce))  # 【MR2】refill 完成项带上连接，供 take_refill_done 按连接分发
                 rows.append((host.req_id, n_rows, dest_row))
             slot = self._seqno_slot.pop(seqno, -1)
             if slot >= 0:
                 self._slot_owner[slot] = -1
-            if self._last_delivered == -1 or _stage_sort_key(seqno) > _stage_sort_key(self._last_delivered):
+            if self._last_delivered == -1 or _stage_sort_key(seqno) > _stage_sort_key(self._last_delivered):  # 【MR2】用统一排序键比较，int 和元组 key 可以混用
                 self._last_delivered = seqno
             self._complete_end_plan(seqno, delivered=True)
         return rows
 
-    def batch(self, seqno: LwdStageKey) -> LwdStagedBatch | None:
+    def batch(self, seqno: LwdStageKey) -> LwdStagedBatch | None:  # 【MR2】按 seqno 取批次元数据
         with self._lock:
             return self._batches.get(seqno)
 
@@ -568,7 +568,7 @@ class LwdHostStager:
         """Freeze a request and guard its old plans until they drain."""
         with self._lock:
             req = self._reqs.get(req_id)
-            self._refill_done = [item for item in self._refill_done if item[1] != req_id]
+            self._refill_done = [item for item in self._refill_done if item[1] != req_id]  # 【MR2】请求结束时清掉它还没被取走的 refill 完成项
             self._retire_request(req_id, wait_for_plan=req is None)
             if req is None:
                 return False
@@ -582,8 +582,8 @@ class LwdHostStager:
         """Release host storage and guard only its unpublished old plans."""
         with self._lock:
             req = self._reqs.pop(req_id, None)
-            self._req_connections.pop(req_id, None)
-            self._refill_done = [item for item in self._refill_done if item[1] != req_id]
+            self._req_connections.pop(req_id, None)  # 【MR2】释放请求时清连接绑定
+            self._refill_done = [item for item in self._refill_done if item[1] != req_id]  # 【MR2】同时清理该请求的 refill 完成项
             if req is not None or req_id in self._ended_req_ids:
                 self._retire_request(req_id, wait_for_plan=False)
             if req is None:
@@ -593,7 +593,7 @@ class LwdHostStager:
             self._released_requests += 1
         return freed
 
-    def release_if_drained(self, seqno: LwdStageKey) -> bool:
+    def release_if_drained(self, seqno: LwdStageKey) -> bool:  # 【MR2】批次里的 host 内存都释放后回收批次元数据
         """Drop published batch metadata after its generation's hosts are released."""
         with self._lock:
             if seqno in self._arrival_plan:
@@ -607,7 +607,7 @@ class LwdHostStager:
             self._batches.pop(seqno, None)
             return True
 
-    def batches_holding(self, req_id: str) -> list[LwdStageKey]:
+    def batches_holding(self, req_id: str) -> list[LwdStageKey]:  # 【MR2】查询某请求还在哪些批次里
         with self._lock:
             return [seqno for seqno, req_ids in self._batch_reqs.items() if req_id in req_ids]
 
@@ -618,27 +618,27 @@ class LwdHostStager:
         if pending:
             self._ended_req_ids.add(req_id)
             self._end_pending[req_id] = pending
-            self._end_after[req_id] = max(pending, key=_stage_sort_key)
+            self._end_after[req_id] = max(pending, key=_stage_sort_key)  # 【MR2】记录需要越过的最大 seqno
         elif wait_for_plan:
             self._ended_req_ids.add(req_id)
             self._end_pending[req_id] = set()
             self._end_after[req_id] = self._last_delivered
             self._end_waiting.add(req_id)
 
-    def _complete_end_plan(self, seqno: LwdStageKey, delivered: bool) -> None:
+    def _complete_end_plan(self, seqno: LwdStageKey, delivered: bool) -> None:  # 【MR2】某个批次完成/回滚后，检查哪些结束请求可以释放
         for pending in self._end_pending.values():
             pending.discard(seqno)
         for req_id in list(self._ended_req_ids):
-            if req_id in self._end_waiting:
+            if req_id in self._end_waiting:  # 【MR2】abort 早于首 hint 的请求：只等它自己的第一个计划
                 # An abort that raced ahead of the first hint stays guarded
                 # only until that request's first plan completes/abandons.
                 # Unrelated batches must not release the tombstone.
-                if req_id not in self._batch_reqs.get(seqno, ()):
+                if req_id not in self._batch_reqs.get(seqno, ()):  # 【MR2】无关批次不能释放这个墓碑
                     continue
-                self._end_waiting.discard(req_id)
+                self._end_waiting.discard(req_id)  # 【MR2】自己的计划完成，解除等待
             if self._end_pending.get(req_id):
                 continue
-            if delivered and _stage_sort_key(self._last_delivered) < _stage_sort_key(self._end_after[req_id]):
+            if delivered and _stage_sort_key(self._last_delivered) < _stage_sort_key(self._end_after[req_id]):  # 【MR2】还有更晚的交付，继续保留
                 continue
             self._ended_req_ids.discard(req_id)
             self._end_pending.pop(req_id, None)
@@ -646,7 +646,7 @@ class LwdHostStager:
 
     def _validate_plan(
         self,
-        seqno: LwdStageKey,
+        seqno: LwdStageKey,  # 【MR2】校验计划时同样用 seqno key（含连接）
         numel: int,
         hidden_size: int,
         req_ids: list[str],

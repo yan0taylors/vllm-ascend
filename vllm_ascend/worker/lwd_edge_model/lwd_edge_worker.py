@@ -47,16 +47,16 @@ class LwdEdgeWorker(LwdWorkerBase):
             self.rank,
         )
 
-    def shutdown(self) -> None:
-        """Release channel FIFOs and HCCL groups before native teardown."""
+    def shutdown(self) -> None:  # 【MR2】边侧退出顺序：先停数据面，再销毁 HCCL 通道，最后交给原生清理
+        """Release channel FIFOs and HCCL groups before native teardown."""  # 【MR2】先停数据面，避免接收线程还在使用即将销毁的通道
         try:
-            self.comm_service.shutdown(timeout=5.0)
-            from vllm_ascend.distributed.lwd_data_plane.lwd_channels import (
+            self.comm_service.shutdown(timeout=5.0)  # 【MR2】关闭通信服务（超时 5 秒），确保没有在飞收发
+            from vllm_ascend.distributed.lwd_data_plane.lwd_channels import (  # 【MR2】延迟导入，避免模块加载时就初始化通道相关状态
                 lwd_destroy_channels,
             )
 
-            lwd_destroy_channels()
-        finally:
+            lwd_destroy_channels()  # 【MR2】停完数据面后再销毁本 rank 的所有连接通道
+        finally:  # 【MR2】无论前面是否异常，都要执行基类 shutdown 释放资源
             super().shutdown()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
