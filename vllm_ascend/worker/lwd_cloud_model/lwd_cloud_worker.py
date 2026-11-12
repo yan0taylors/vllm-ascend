@@ -84,7 +84,7 @@ class LwdCloudWorker(LwdWorkerBase):
         self._lwd_connections = tuple(
             connection.connection_id
             for connection in lwd_config.connections
-            if connection.dp_idx == self._lwd_dp_idx
+            if connection.connection_id.dp_idx == self._lwd_dp_idx
         )
         if not self._lwd_connections:
             self._lwd_connections = (ConnectionId(0, lwd_config.instance.id, self._lwd_dp_idx),)
