@@ -9,8 +9,26 @@ from typing import Any, Literal
 
 from vllm.config.lwd.topology import LwdConnectionId
 
+ConnectionId = LwdConnectionId
+"""Short local alias used by the role-side data-plane implementation."""
+
 LWD_DEFAULT_CONNECTION_ID = LwdConnectionId(edge_id=0, cloud_id=0, dp_idx=0)
 """Compatibility identity for the original one-edge, one-cloud, DP0 path."""
+
+
+def connection_from(metadata: Any) -> LwdConnectionId:
+    """Read the canonical identity stamped on a scheduler batch."""
+    connection = getattr(metadata, "connection_id", None)
+    if connection is not None:
+        return connection
+    # Compatibility for test doubles and pre-MR1 call boundaries. Scheduler
+    # metadata always carries connection_id; no second runtime numbering is
+    # introduced here.
+    return LwdConnectionId(
+        getattr(metadata, "edge_id", 0),
+        getattr(metadata, "cloud_id", 0),
+        getattr(metadata, "dp_idx", 0),
+    )
 
 
 class LwdChannelType(enum.Enum):
@@ -30,6 +48,14 @@ class LwdTransferStatus(enum.Enum):
     PENDING = "pending"
     OK = "ok"
     ERROR = "error"
+
+
+class LwdTransferPostingError(RuntimeError):
+    """A submission failure with explicit HCCL posting provenance."""
+
+    def __init__(self, message: str, *, posted: bool) -> None:
+        super().__init__(message)
+        self.posted = posted
 
 
 @dataclass
@@ -89,6 +115,11 @@ class LwdTransferRequest:
     # recv: optional segmented D2H destinations. Each tuple contains a pinned
     # host view, a flat source element offset, and the number of elements.
     stage_segments: list[tuple[Any, int, int]] | None = None
+
+    @property
+    def connection(self) -> LwdConnectionId:
+        """Compatibility view; connection_id remains the sole stored key."""
+        return self.connection_id
 
 
 @dataclass

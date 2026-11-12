@@ -32,7 +32,10 @@ from vllm.logger import logger
 
 from vllm_ascend.distributed.lwd_data_plane import lwd_channels
 from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import LwdTransferFuture
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType, LwdTransferRequest
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import (
+    LwdChannelType,
+    LwdTransferRequest,
+)
 
 
 def _lwd_scramble_seed_for(request: LwdTransferRequest) -> int | None:
