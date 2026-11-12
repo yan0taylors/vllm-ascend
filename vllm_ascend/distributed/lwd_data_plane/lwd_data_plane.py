@@ -13,15 +13,22 @@ from __future__ import annotations
 
 import threading
 
+from vllm.config.lwd.topology import LwdConnectionId
 from vllm.logger import logger
 
 from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import LwdTransferFuture
 from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_queue import LwdTransferQueue
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType, LwdTransferRequest
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import (
+    LWD_DEFAULT_CONNECTION_ID,
+    LwdChannelType,
+    LwdTransferRequest,
+)
+
+_LwdQueueKey = tuple[LwdConnectionId, LwdChannelType, str]
 
 
 class LwdDataPlane:
-    """Process-wide singleton.  All public methods are thread-safe."""
+    """Process-wide singleton. All public methods are thread-safe."""
 
     _instance: LwdDataPlane | None = None
     _instance_lock = threading.Lock()
@@ -34,14 +41,14 @@ class LwdDataPlane:
             return cls._instance
 
     def __init__(self) -> None:
-        # HCCL ordering is per physical (channel, direction): send and
-        # recv have INDEPENDENT seqno streams (each peer's send order must
-        # match the other side's recv-post order), so the FIFO key is
-        # (dp_idx, channel, op) — merging directions would make a
-        # process's sends and recvs on one channel collide on a shared
-        # seqno counter, and merging connections would collide their
-        # independent seqno streams.
-        self._queues: dict[tuple[int, LwdChannelType, str], LwdTransferQueue] = {}
+        # Each physical channel has independent send and receive seqno
+        # streams. Connections never share FIFO state, even when dp_idx and
+        # seqno are equal.
+        self._queues: dict[_LwdQueueKey, LwdTransferQueue] = {}
+        # A skip can arrive before the first request creates its queue. Keep
+        # those holes outside the queue so queue creation cannot erase them.
+        self._deferred_skips: dict[_LwdQueueKey, set[int]] = {}
+        self._connection_errors: dict[LwdConnectionId, BaseException] = {}
         self._lock = threading.Lock()
         self._shutting_down = False
 
@@ -54,8 +61,8 @@ class LwdDataPlane:
         return self._submit(request)
 
     def submit_recv(self, request: LwdTransferRequest) -> LwdTransferFuture:
-        """Submit a recv.  The irecv is posted immediately — "early" is a
-        property of when you submit, not a separate API."""
+        """Submit a recv. The irecv is posted immediately: early submission
+        is a caller decision, not a separate API."""
         assert request.op == "recv", "submit_recv requires op='recv'"
         return self._submit(request)
 
@@ -64,13 +71,7 @@ class LwdDataPlane:
     # ------------------------------------------------------------------ #
 
     def poll_completions(self) -> int:
-        """Reap every channel once.  Call from an existing loop head;
-        costs one head-of-line ``event.query()`` per channel with
-        pending traffic."""
-        # TODO(lwd): confirm whether the edge should reap too. On the mm branch
-        # only the cloud worker calls this; submit() reaps its own queue only,
-        # so an edge UP send snapshot (one prefill batch) stays alive until the
-        # next UP send.
+        """Reap every channel once from an existing host loop head."""
         with self._lock:
             queues = list(self._queues.values())
         completed = 0
@@ -83,20 +84,41 @@ class LwdDataPlane:
         channel_type: LwdChannelType,
         seqno: int,
         op: str = "recv",
-        dp_idx: int = 0,
+        *,
+        connection_id: LwdConnectionId = LWD_DEFAULT_CONNECTION_ID,
     ) -> None:
-        """Mark a seqno as never-to-arrive (aborted request) on the given
-        connection, channel and direction FIFO.  Recv managers' drop path
-        passes op="recv"; the sender-side abort glue passes op="send".  Both
-        peers must skip the same seqnos."""
+        """Skip one seqno only on the selected connection/channel/op FIFO.
+
+        Both peers must skip the same seqno. If the queue does not exist yet,
+        the hole is retained by the data plane and applied before the new
+        queue becomes visible to submitters.
+        """
+        key = (connection_id, channel_type, op)
         with self._lock:
-            queue = self._queues.get((dp_idx, channel_type, op))
-        if queue is not None:
-            queue.skip_seqno(seqno)
+            queue = self._queues.get(key)
+            if queue is None:
+                self._deferred_skips.setdefault(key, set()).add(seqno)
+                return
+        queue.skip_seqno(seqno)
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                           #
     # ------------------------------------------------------------------ #
+
+    def abort_connection(self, connection_id: LwdConnectionId, error: BaseException) -> None:
+        """Persist a terminal error and reject new transfers on one connection.
+
+        Aborted queues stay registered for ``poll_completions``: posted futures
+        report the error immediately, but their handles and send keepalives are
+        released only after the device events complete. Other connections are
+        independent. Recovery is a process-lifecycle decision.
+        """
+        with self._lock:
+            self._connection_errors[connection_id] = error
+            queues = [queue for key, queue in self._queues.items() if key[0] == connection_id]
+        for queue in queues:
+            queue.abort(error)
+        logger.warning("[LWD] aborted data-plane connection %s: %r", connection_id, error)
 
     def shutdown(self, timeout: float | None = None) -> None:
         with self._lock:
@@ -110,6 +132,8 @@ class LwdDataPlane:
         finally:
             with self._lock:
                 self._queues.clear()
+                self._deferred_skips.clear()
+                self._connection_errors.clear()
                 self._shutting_down = False
         logger.info("[lwd-comm] service shut down")
 
@@ -118,13 +142,20 @@ class LwdDataPlane:
     # ------------------------------------------------------------------ #
 
     def _submit(self, request: LwdTransferRequest) -> LwdTransferFuture:
+        key = (request.connection_id, request.channel, request.op)
         with self._lock:
             if self._shutting_down:
                 raise RuntimeError("lwd-comm service is shutting down")
-            key = (request.dp_idx, request.channel, request.op)
+            error = self._connection_errors.get(request.connection_id)
+            if error is not None:
+                raise RuntimeError(f"lwd-comm connection {request.connection_id} has failed: {error!r}") from error
             queue = self._queues.get(key)
             if queue is None:
-                queue = LwdTransferQueue(request.dp_idx, request.channel, request.op)
+                queue = LwdTransferQueue(request.connection_id, request.channel, request.op)
+                # Apply pre-queue skips before publishing the queue. Another
+                # thread therefore cannot observe an unhydrated FIFO.
+                for skipped in sorted(self._deferred_skips.pop(key, set())):
+                    queue.skip_seqno(skipped)
                 self._queues[key] = queue
         return queue.submit(request)
 

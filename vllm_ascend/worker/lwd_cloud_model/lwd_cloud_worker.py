@@ -76,6 +76,15 @@ class LwdCloudWorker(LwdWorkerBase):
         lwd_config = self.vllm_config.lwd_config
         assert lwd_config is not None
         self._lwd_dp_idx = self.vllm_config.parallel_config.data_parallel_index
+        connections = tuple(
+            connection for connection in lwd_config.connections if connection.dp_idx == self._lwd_dp_idx
+        )
+        if len(connections) != 1:
+            raise NotImplementedError(
+                "[LWD] the current cloud worker requires exactly one edge "
+                f"connection for dp_idx={self._lwd_dp_idx}, got {len(connections)}"
+            )
+        self._lwd_connection_id = connections[0].connection_id
         endpoint_rank = lwd_config.instance.dp[self._lwd_dp_idx].ranks[0]
         global_rank = dist.get_rank()
         self._lwd_early_recv_endpoint = global_rank == endpoint_rank
@@ -209,7 +218,7 @@ class LwdCloudWorker(LwdWorkerBase):
         return LwdTransferRequest(
             channel=LwdChannelType.UP,
             op="recv",
-            dp_idx=self._lwd_dp_idx,
+            connection_id=self._lwd_connection_id,
             num_elements=hash_payload_numel(
                 fields.num_tokens,
                 self._lwd_up_hidden_size,
@@ -464,7 +473,7 @@ class LwdCloudWorker(LwdWorkerBase):
                     channel=LwdChannelType.DOWN,
                     op="send",
                     num_elements=hidden.numel(),
-                    dp_idx=self._lwd_dp_idx,
+                    connection_id=self._lwd_connection_id,
                     tensor=hidden,
                     seqno=seqno,
                 )
@@ -476,6 +485,7 @@ class LwdCloudWorker(LwdWorkerBase):
                 req_ids,
                 hidden.numel(),
                 seqno,
+                self._lwd_connection_id,
             )
             # The event belongs to this output generation and must be consumed
             # before the output crosses the process boundary.

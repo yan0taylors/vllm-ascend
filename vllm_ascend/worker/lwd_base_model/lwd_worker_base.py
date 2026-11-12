@@ -52,17 +52,14 @@ class LwdWorkerBase(NPUWorker):
     def _init_lwd_data_plane(self) -> None:
         # The data-plane channels MUST be built here, never in ``__init__``.
         # ``lwd_init_channels`` creates the HCCL process groups of every DP
-        # connection (``dist.new_group``) and then warms them up with a
-        # two-sided P2P exchange (world barrier plus the edge/cloud
-        # isend/irecv pair), so it needs the distributed environment --
-        # world group -- which the distributed init above only builds
-        # inside ``init_device``. The executor constructs the worker first
-        # and calls ``init_device`` afterwards, so running it from
-        # ``__init__`` would trip the "group is not initialized"
-        # assertions; the two-sided warmup additionally requires both
-        # peers to reach it in the same fixed order, which only holds once
-        # every rank is past its distributed init. Subclasses call this at
-        # exactly the position they previously built the channels inline.
+        # connection (``dist.new_group``) and then warms each pair with a
+        # bounded, two-sided identity handshake. Group creation still needs
+        # the distributed environment built inside ``init_device``; warmup
+        # itself deliberately has no cross-edge/cloud world barrier or
+        # all-reduce. The executor constructs the worker first and calls
+        # ``init_device`` afterwards, so running this from ``__init__`` would
+        # trip the "group is not initialized" assertions. Subclasses call
+        # this at exactly the position they previously built channels inline.
         #
         # Ascend-side MC2 groups and the vllm-side TP/EP groups need no
         # override here: native ``init_ascend_model_parallel`` routes to

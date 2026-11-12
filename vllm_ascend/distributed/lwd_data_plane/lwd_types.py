@@ -7,6 +7,11 @@ import enum
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from vllm.config.lwd.topology import LwdConnectionId
+
+LWD_DEFAULT_CONNECTION_ID = LwdConnectionId(edge_id=0, cloud_id=0, dp_idx=0)
+"""Compatibility identity for the original one-edge, one-cloud, DP0 path."""
+
 
 class LwdChannelType(enum.Enum):
     """The two physical data-plane channels, direction-only.
@@ -42,10 +47,9 @@ class LwdTransferRequest:
     # 32 + R*(H+3K)).  recv: used to allocate the exact-size buffer
     # (HCCL P2P requires matching numel on both ends).
     num_elements: int
-    # DP connection this transfer belongs to; the edge serves several
-    # connections, so its channel choice is per transfer. Defaults to 0
-    # and keeps single-connection behaviour.
-    dp_idx: int = 0
+    # Full edge -> cloud DP connection. The zero identity is only a
+    # compatibility default for 1E1C DP0; multi-DP callers must set dp_idx.
+    connection_id: LwdConnectionId = LWD_DEFAULT_CONNECTION_ID
     # send: payload tensor (snapshotted into a communication-owned buffer
     # at submit time).  recv: None.
     tensor: Any | None = None

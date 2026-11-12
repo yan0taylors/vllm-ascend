@@ -27,6 +27,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from vllm.config.lwd.topology import LwdConnectionId
 from vllm.logger import logger
 
 from vllm_ascend.distributed.lwd_data_plane import lwd_channels
@@ -57,10 +58,10 @@ def _lwd_scramble_seed_for(request: LwdTransferRequest) -> int | None:
 
 
 class LwdTransferQueue:
-    """One FIFO of pending requests for one DP connection, channel and op."""
+    """One strict FIFO for one ConnectionId, channel and operation."""
 
-    def __init__(self, dp_idx: int, channel_type: LwdChannelType, op: str) -> None:
-        self.dp_idx = dp_idx
+    def __init__(self, connection_id: LwdConnectionId, channel_type: LwdChannelType, op: str) -> None:
+        self.connection_id = connection_id
         self.channel_type = channel_type
         self.op = op  # one FIFO carries exactly one direction's seqno stream
         self._pending: deque[LwdTransferFuture] = deque()
@@ -74,6 +75,11 @@ class LwdTransferQueue:
         # requests).  Skipped when advancing so one abort cannot wedge
         # every later request on this channel.
         self._skipped: set[int] = set()
+        self._abort_error: BaseException | None = None
+
+    @property
+    def _context(self) -> str:
+        return f"connection={self.connection_id} channel={self.channel_type.value} op={self.op}"
 
     # ------------------------------------------------------------------ #
     # Abort holes                                                         #
@@ -94,7 +100,7 @@ class LwdTransferQueue:
             # waiter fails promptly instead of waiting out the timeout.
             held = self._held.pop(seqno, None)
             if held is not None:
-                held[1]._finalize(error=RuntimeError(f"seqno {seqno} aborted on channel {self.channel_type.value}"))
+                held[1]._finalize(error=RuntimeError(f"seqno {seqno} aborted on {self._context}"))
             self._skipped.add(seqno)
             self._advance_past_skipped()
 
@@ -115,14 +121,18 @@ class LwdTransferQueue:
     def submit(self, request: LwdTransferRequest) -> LwdTransferFuture:
         """Execute the channel op and enqueue the future."""
         if request.op != self.op:
-            raise RuntimeError(
-                f"op mismatch on {self.channel_type.value} FIFO: channel carries {self.op!r}, got {request.op!r}"
-            )
+            raise RuntimeError(f"op mismatch on {self._context}: got {request.op!r}")
+        if request.connection_id != self.connection_id:
+            raise RuntimeError(f"connection mismatch on {self._context}: request has {request.connection_id}")
+        if self._abort_error is not None:
+            raise RuntimeError(f"FIFO is aborted on {self._context}") from self._abort_error
         finalized = self._reap()
         self._finalize_many(finalized)
         if request.op == "send":
             request = self._snapshot_send(request)
         with self._submission_lock:
+            if self._abort_error is not None:
+                raise RuntimeError(f"FIFO is aborted on {self._context}") from self._abort_error
             if request.seqno is not None:
                 return self._submit_sequenced(request)
             return self._execute_next(request)
@@ -163,16 +173,13 @@ class LwdTransferQueue:
             # the request with an error result so the caller's readiness
             # gate fails this request promptly.
             logger.warning(
-                "[lwd-comm] dropping submission of skipped/duplicate seqno %d on channel %s %s (next expected %d)",
+                "[lwd-comm] dropping skipped/duplicate seqno %d on %s (next expected %d)",
                 seqno,
-                self.channel_type.value,
-                self.op,
+                self._context,
                 self._next_seqno,
             )
             future = LwdTransferFuture(request, [], None)
-            future._finalize(
-                error=RuntimeError(f"seqno {seqno} was skipped (aborted) on channel {self.channel_type.value}")
-            )
+            future._finalize(error=RuntimeError(f"seqno {seqno} was skipped on {self._context}"))
             return future
         if seqno > self._next_seqno:
             if seqno in self._held:
@@ -183,22 +190,22 @@ class LwdTransferQueue:
             future = LwdTransferFuture.deferred(request)
             self._held[seqno] = (request, future)
             logger.debug(
-                "[lwd-comm] held out-of-order %s %s seqno=%d (next=%d)",
-                self.channel_type.value,
-                request.op,
+                "[lwd-comm] held out-of-order %s seqno=%d (next=%d)",
+                self._context,
                 seqno,
                 self._next_seqno,
             )
             return future
         future = self._execute_next(request)
         self._next_seqno += 1
-        # TODO(lwd): confirm whether this drain should also step over skipped
-        # seqnos, as _advance_past_skipped does: a held seqno right after a
-        # skipped one is only posted on the next submit or skip_seqno call.
+        # Step over abort holes after every posted request. Otherwise a held
+        # successor remains deferred until unrelated future traffic arrives.
+        self._advance_past_skipped()
         while self._next_seqno in self._held:
             held_request, held_future = self._held.pop(self._next_seqno)
             self._execute_next(held_request, into=held_future)
             self._next_seqno += 1
+            self._advance_past_skipped()
         return future
 
     def _execute_next(
@@ -229,14 +236,29 @@ class LwdTransferQueue:
         self._finalize_many(finalized)
         return finalized
 
+    def abort(self, error: BaseException) -> None:
+        """Fail this FIFO while retaining posted work until device completion."""
+        with self._submission_lock:
+            self._abort_error = error
+            for _request, future in self._held.values():
+                future._finalize(error=error)
+            self._held.clear()
+            with self._lock:
+                pending = list(self._pending)
+            for future in pending:
+                future._fail(error)
+            self._skipped.clear()
+            finalized = self._reap()
+            self._finalize_many(finalized)
+
     def shutdown(self, timeout: float | None = None) -> list[LwdTransferFuture]:
         """Wait for pending operations before releasing owned buffers."""
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._submission_lock:
             if self._held:
                 logger.warning(
-                    "[lwd-comm] shutdown on channel %s with %d held (never-posted) request(s); lowest missing seqno=%s",
-                    self.channel_type.value,
+                    "[lwd-comm] shutdown on %s with %d held request(s); lowest missing seqno=%s",
+                    self._context,
                     len(self._held),
                     self._next_seqno,
                 )
@@ -244,16 +266,14 @@ class LwdTransferQueue:
                 # waiters must not hang until the readiness-gate timeout.
                 for _, held_future in self._held.values():
                     held_future._finalize(
-                        error=RuntimeError(
-                            f"channel {self.channel_type.value} shut down with the request still held (never posted)"
-                        )
+                        error=RuntimeError(f"FIFO shut down with the request still held on {self._context}")
                     )
                 self._held.clear()
             with self._lock:
                 pending = list(self._pending)
             for future in pending:
                 remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-                future.wait(timeout=remaining)
+                future._wait_for_device(timeout=remaining)
             finalized = self._reap()
             self._finalize_many(finalized)
             return finalized
@@ -261,7 +281,7 @@ class LwdTransferQueue:
     def _reap(self) -> list[LwdTransferFuture]:
         done: list[LwdTransferFuture] = []
         with self._lock:
-            while self._pending and self._pending[0].done():
+            while self._pending and self._pending[0]._ready_to_reap():
                 done.append(self._pending.popleft())
         return done
 
@@ -350,7 +370,7 @@ class LwdTransferQueue:
         return into
 
     def _stream(self) -> Any:
-        return lwd_channels.lwd_get_channel_stream(self.channel_type, self.dp_idx)
+        return lwd_channels.lwd_get_channel_stream(self.channel_type, connection_id=self.connection_id)
 
     def _copy_stream(self) -> torch.npu.Stream:
         stream = getattr(self, "_d2h_copy_stream", None)
@@ -375,17 +395,17 @@ class LwdTransferQueue:
             staged_event.record()
         return staged_event
 
-    @staticmethod
-    def _validate_stage_segments(req: LwdTransferRequest) -> None:
+    def _validate_stage_segments(self, req: LwdTransferRequest) -> None:
         if req.stage_segments is None:
             return
         for dst, src_offset, numel in req.stage_segments:
             if src_offset < 0 or numel < 0 or src_offset + numel > req.num_elements:
                 raise ValueError(
-                    f"invalid stage segment offset={src_offset} numel={numel} for recv num_elements={req.num_elements}"
+                    f"invalid stage segment offset={src_offset} numel={numel} "
+                    f"for recv num_elements={req.num_elements} on {self._context}"
                 )
             if dst.numel() != numel:
-                raise ValueError(f"stage destination numel {dst.numel()} != segment numel {numel}")
+                raise ValueError(f"stage destination numel {dst.numel()} != segment numel {numel} on {self._context}")
 
     def _order_after(self, predecessor: LwdTransferFuture | None) -> None:
         if predecessor is None:
@@ -395,15 +415,15 @@ class LwdTransferQueue:
             self._stream().wait_event(event)
 
     def _post_send(self, req: LwdTransferRequest) -> list[Any]:
-        group = lwd_channels.lwd_get_channel_device_group(self.channel_type, self.dp_idx)
+        group = lwd_channels.lwd_get_channel_device_group(self.channel_type, connection_id=self.connection_id)
         peer = req.peer_rank
         if peer is None:
-            peer = lwd_channels.lwd_get_channel_peer(self.channel_type, self.dp_idx)
+            peer = lwd_channels.lwd_get_channel_peer(self.channel_type, connection_id=self.connection_id)
         tensor = req.tensor
         assert tensor is not None
         logger.debug(
-            "[lwd-comm] SEND post channel=%s my_rank=%d peer=%s group_ranks=%s shape=%s dtype=%s op=isend",
-            self.channel_type,
+            "[lwd-comm] SEND post %s my_rank=%d peer=%s group_ranks=%s shape=%s dtype=%s op=isend",
+            self._context,
             dist.get_rank(),
             peer,
             dist.get_process_group_ranks(group),
@@ -425,17 +445,17 @@ class LwdTransferQueue:
                 handles.append(dist.isend(req.aux_tensor.contiguous(), dst=peer, group=group))
             return handles
         if req.aux_tensor is not None:
-            raise RuntimeError("aux payload is only supported on the UP channel")
+            raise RuntimeError(f"aux payload is only supported on UP: {self._context}")
         return [dist.isend(tensor.contiguous(), dst=peer, group=group)]
 
     def _post_recv(self, req: LwdTransferRequest) -> tuple[torch.Tensor, torch.Tensor | None, list[Any]]:
-        group = lwd_channels.lwd_get_channel_device_group(self.channel_type, self.dp_idx)
+        group = lwd_channels.lwd_get_channel_device_group(self.channel_type, connection_id=self.connection_id)
         peer = req.peer_rank
         if peer is None:
-            peer = lwd_channels.lwd_get_channel_peer(self.channel_type, self.dp_idx)
+            peer = lwd_channels.lwd_get_channel_peer(self.channel_type, connection_id=self.connection_id)
         logger.debug(
-            "[lwd-comm] RECV post channel=%s my_rank=%d src=%s group_ranks=%s num_elements=%d aux_elements=%d op=irecv",
-            self.channel_type,
+            "[lwd-comm] RECV post %s my_rank=%d src=%s group_ranks=%s num_elements=%d aux_elements=%d op=irecv",
+            self._context,
             dist.get_rank(),
             peer,
             dist.get_process_group_ranks(group),
@@ -449,7 +469,7 @@ class LwdTransferQueue:
         elif buffer.numel() != req.num_elements:
             raise RuntimeError(
                 f"recv_buffer numel {buffer.numel()} != requested num_elements {req.num_elements} "
-                f"on channel {self.channel_type.value} seqno={req.seqno}"
+                f"on {self._context} seqno={req.seqno}"
             )
         self._validate_stage_segments(req)
         aux_buffer = None
@@ -471,7 +491,7 @@ class LwdTransferQueue:
                 ],
             )
         if req.aux_num_elements > 0:
-            raise RuntimeError("aux payload is only supported on the UP channel")
+            raise RuntimeError(f"aux payload is only supported on UP: {self._context}")
         return buffer, None, [dist.irecv(buffer, src=peer, group=group)]
 
     def _bridge_and_record(self, handles: list[Any]):
@@ -496,8 +516,8 @@ class LwdTransferQueue:
             (time.monotonic() - _t) * 1000,
         )
         logger.debug(
-            "[lwd-comm] DONE channel=%s my_rank=%d handles=%d",
-            self.channel_type,
+            "[lwd-comm] DONE %s my_rank=%d handles=%d",
+            self._context,
             dist.get_rank(),
             len(handles),
         )

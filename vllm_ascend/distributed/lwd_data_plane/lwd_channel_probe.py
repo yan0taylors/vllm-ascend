@@ -13,26 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-"""Identity probe carried by the channel warmup round-trip.
+"""Identity probe exchanged by each connection's UP/DOWN warmup handshake.
 
-Before any business payload flows, each channel's existing warmup
-isend/irecv carries one self-describing frame instead of zeros: the sender
-derives an 8-element bf16 frame from public facts only (its own global rank,
-the DP connection index, the channel direction), and the receiver
-independently rebuilds the expected frame and compares field by field.  A
-wrong peer, a crossed connection, a swapped direction or a corrupted /
-never-written buffer therefore fails loudly here, at init time, instead of
-surfacing as an ~1836 s HCCL hang on first business traffic.
+Both peers independently derive a frame from the sender's global rank, the
+full ``LwdConnectionId`` and the channel direction. The receiver compares
+every field, so a wrong peer, crossed connection, swapped direction or
+corrupted buffer fails during startup rather than on the first business
+payload. Int32 fields retain large topology IDs exactly; the previous bf16
+frame could only represent IDs below 256.
 
-This module is deliberately a **leaf** next to ``lwd_payload_scrambler``: it
-reads no configuration and imports nothing from this project except
-``LwdChannelType``.  Both ends derive the frame from the same public facts,
-so the probe needs no nonce and no exchange of its own.
-
-Scope note: this probes the handshake only.  Corruption of real in-flight
-transfers (buffer reuse, stream races, truncation) needs a runtime checksum,
-and large-message / segmented-path acceptance belongs to the offline
-hccl_test matrix.
+This module is deliberately a leaf beside ``lwd_payload_scrambler``. It reads
+no configuration and performs no world collective. Corruption of business
+payloads still needs runtime checks; payload geometry and large-message
+acceptance are covered separately.
 """
 
 from __future__ import annotations
@@ -42,82 +35,121 @@ import time
 from typing import Any
 
 import torch
-import torch.distributed as dist
+from vllm.config.lwd.topology import LwdConnectionId
 
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
 
 __all__ = [
     "LWD_PROBE_TIMEOUT_S",
-    "lwd_probe_aggregate",
     "lwd_probe_frame",
+    "lwd_probe_verdict_frame",
+    "lwd_probe_verdict_verify",
     "lwd_probe_verify",
     "lwd_probe_wait",
 ]
 
-# Fail-fast budget; public because the caller logs it in failure messages.
-# Far above a healthy rendezvous, with headroom for a temporarily degraded
-# link rather than a wedged one.
+# One bounded budget covers posting, all identity/verdict P2P operations and
+# verification D2H for a connection. The caller reports the current phase on timeout.
 LWD_PROBE_TIMEOUT_S = 30.0
 _LWD_PROBE_POLL_INTERVAL_S = 0.02
 
-# Frame layout: 8 elements, self-describing, size-invariant (the warmup has
-# always carried exactly this many elements).
-_LWD_PROBE_FRAME_NUM_ELEMENTS = 8
-# bf16 represents every integer in [0, 256) exactly (8-bit significand), so
-# the frame crosses the wire losslessly; wider identities fail fast instead.
-_LWD_PROBE_FIELD_LIMIT = 256
+_LWD_PROBE_FRAME_NUM_ELEMENTS = 12
+_LWD_PROBE_FIELD_LIMIT = 2**31 - 1
 _LWD_PROBE_MAGIC = 90
-# The three check sequences are reduced mod 251 (a prime inside the exact
-# bf16 range), so they stay in-range and mix the identity fields.
-_LWD_PROBE_CHECKSUM_MOD = 251
+_LWD_PROBE_CHECKSUM_MOD = 2**31 - 1
+_LWD_PROBE_VERDICT_FRAME_NUM_ELEMENTS = 3
+_LWD_PROBE_VERDICT_MAGIC = 91
+_LWD_PROBE_VERDICT_FAILED = 0
+_LWD_PROBE_VERDICT_OK = 1
 
 _LWD_PROBE_FIELD_NAMES = {
     0: "not a probe frame / recv not written",
     1: "peer rank mismatch",
-    2: "dp_idx mismatch (crossed connection)",
-    3: "channel direction mismatch",
-    4: "frame length mismatch",
-    5: "data corruption",
-    6: "data corruption",
-    7: "data corruption",
+    2: "edge_id mismatch (crossed connection)",
+    3: "cloud_id mismatch (crossed connection)",
+    4: "dp_idx mismatch (crossed connection)",
+    5: "channel direction mismatch",
+    6: "frame length mismatch",
+    7: "peer rank checksum mismatch",
+    8: "edge_id checksum mismatch",
+    9: "cloud_id checksum mismatch",
+    10: "dp_idx checksum mismatch",
+    11: "identity/direction checksum mismatch",
 }
+
+
+def _lwd_probe_field(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < _LWD_PROBE_FIELD_LIMIT:
+        raise ValueError(f"[LWD] probe {name}={value!r} must be an integer in [0, 2^31-1)")
+    return value
 
 
 def lwd_probe_frame(
     sender_rank: int,
-    dp_idx: int,
+    connection_id: LwdConnectionId,
     channel: LwdChannelType,
     device: str | torch.device = "npu",
 ) -> torch.Tensor:
-    """The identity frame both peers derive from the same public facts.
-
-    Built as float32 on the CPU and cast down, so the values never depend on
-    how the target backend converts a Python integer list: bf16 exactness is
-    guaranteed by the range check, not by the backend.
-    """
-    ch = 0 if channel is LwdChannelType.UP else 1
-    assert 0 <= sender_rank < _LWD_PROBE_FIELD_LIMIT, f"sender_rank={sender_rank} out of range"
-    assert 0 <= dp_idx < _LWD_PROBE_FIELD_LIMIT, f"dp_idx={dp_idx} out of range"
-    vals = (
+    """Build the identity frame from facts independently known by both peers."""
+    if not isinstance(channel, LwdChannelType):
+        raise ValueError(f"[LWD] invalid probe channel: {channel!r}")
+    rank = _lwd_probe_field(sender_rank, "sender_rank")
+    edge = _lwd_probe_field(connection_id.edge_id, "edge_id")
+    cloud = _lwd_probe_field(connection_id.cloud_id, "cloud_id")
+    dp = _lwd_probe_field(connection_id.dp_idx, "dp_idx")
+    direction = 0 if channel is LwdChannelType.UP else 1
+    values = (
         _LWD_PROBE_MAGIC,
-        sender_rank,
-        dp_idx,
-        ch,
+        rank,
+        edge,
+        cloud,
+        dp,
+        direction,
         _LWD_PROBE_FRAME_NUM_ELEMENTS,
-        (sender_rank + 5) % _LWD_PROBE_CHECKSUM_MOD,
-        (dp_idx * 7 + 11) % _LWD_PROBE_CHECKSUM_MOD,
-        (ch * 13 + 17) % _LWD_PROBE_CHECKSUM_MOD,
+        (rank + 5) % _LWD_PROBE_CHECKSUM_MOD,
+        (edge * 7 + 11) % _LWD_PROBE_CHECKSUM_MOD,
+        (cloud * 13 + 17) % _LWD_PROBE_CHECKSUM_MOD,
+        (dp * 19 + 23) % _LWD_PROBE_CHECKSUM_MOD,
+        (direction * 29 + rank * 31 + edge * 37 + cloud * 41 + dp * 43 + 47) % _LWD_PROBE_CHECKSUM_MOD,
     )
-    frame = torch.tensor(vals, dtype=torch.float32).to(torch.bfloat16)
-    return frame.to(device)
+    return torch.tensor(values, dtype=torch.int32).to(device)
+
+
+def _lwd_probe_verdict_checksum(status: int) -> int:
+    return (_LWD_PROBE_VERDICT_MAGIC * 3 + status * 37 + 59) % _LWD_PROBE_CHECKSUM_MOD
+
+
+def lwd_probe_verdict_frame(local_ok: bool, device: str | torch.device = "npu") -> torch.Tensor:
+    """Encode the sender's identity-check result for the second handshake round."""
+    status = _LWD_PROBE_VERDICT_OK if local_ok else _LWD_PROBE_VERDICT_FAILED
+    values = (_LWD_PROBE_VERDICT_MAGIC, status, _lwd_probe_verdict_checksum(status))
+    return torch.tensor(values, dtype=torch.int32).to(device)
+
+
+def lwd_probe_verdict_verify(got: torch.Tensor) -> str:
+    """Return an empty string for peer success, or the peer/verdict failure."""
+    if got.numel() != _LWD_PROBE_VERDICT_FRAME_NUM_ELEMENTS:
+        return (
+            f"peer verdict frame length mismatch: got {got.numel()} elements, "
+            f"expected {_LWD_PROBE_VERDICT_FRAME_NUM_ELEMENTS}"
+        )
+    if got.dtype != torch.int32:
+        return f"peer verdict frame dtype mismatch: got {got.dtype}, expected torch.int32"
+    magic, status, checksum = _lwd_probe_values(got)
+    if magic != _LWD_PROBE_VERDICT_MAGIC:
+        return f"peer verdict frame magic mismatch: got {magic}"
+    if status not in (_LWD_PROBE_VERDICT_FAILED, _LWD_PROBE_VERDICT_OK):
+        return f"peer verdict status mismatch: got {status}"
+    expected_checksum = _lwd_probe_verdict_checksum(status)
+    if checksum != expected_checksum:
+        return f"peer verdict checksum mismatch: got {checksum}, expected {expected_checksum}"
+    if status == _LWD_PROBE_VERDICT_FAILED:
+        return "peer reported identity mismatch"
+    return ""
 
 
 def lwd_probe_wait(handle: Any, timeout_s: float = LWD_PROBE_TIMEOUT_S) -> bool:
-    """True when the op completed; False on TIMEOUT (wedged channel).
-
-    ``is_completed()`` only observes completion, so the final ``wait()`` is
-    kept to surface an op that completed with an error.
-    """
+    """Return false on timeout, or wait to surface a completed op's error."""
     deadline = time.monotonic() + timeout_s
     while not handle.is_completed():
         if time.monotonic() >= deadline:
@@ -128,51 +160,38 @@ def lwd_probe_wait(handle: Any, timeout_s: float = LWD_PROBE_TIMEOUT_S) -> bool:
 
 
 def _lwd_probe_values(frame: torch.Tensor) -> list[int]:
-    """Frame fields as integers, read back through float32.
-
-    Non-finite entries (a corrupted buffer can carry NaN/Inf bit patterns)
-    collapse to -1, so a damaged frame is reported as MISMATCH instead of
-    raising: the caller must keep probing on MISMATCH to stay paired with
-    the peer, and an exception here would abort instead.
-    """
+    """Read integer fields without lossy bf16/float32 conversion."""
     values: list[int] = []
-    for v in frame.to(torch.float32).tolist():
-        values.append(int(v) if math.isfinite(v) else -1)
+    for value in frame.reshape(-1).cpu().tolist():
+        if isinstance(value, int):
+            values.append(value)
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError):
+            values.append(-1)
+            continue
+        values.append(int(numeric) if math.isfinite(numeric) and numeric.is_integer() else -1)
     return values
 
 
 def lwd_probe_verify(
     got: torch.Tensor,
     peer: int,
-    dp_idx: int,
+    connection_id: LwdConnectionId,
     channel: LwdChannelType,
 ) -> str:
-    """Field-by-field compare on the receiver; "" = pass, else diagnosis.
-
-    Compared as integers on the CPU after a float32 upcast.  Never through
-    ``Tensor.view(dtype)``: the bit-view overload is not reliably available
-    on torch_npu, where it silently yields unusable values and makes the
-    frame mismatch on every run.
-    """
+    """Compare every identity field; return an empty string on success."""
     if got.numel() != _LWD_PROBE_FRAME_NUM_ELEMENTS:
         return f"frame length mismatch: got {got.numel()} elements, expected {_LWD_PROBE_FRAME_NUM_ELEMENTS}"
-    expected = lwd_probe_frame(peer, dp_idx, channel, device=str(got.device))
-    got_vals = _lwd_probe_values(got)
-    exp_vals = _lwd_probe_values(expected)
+    if got.dtype != torch.int32:
+        return f"frame dtype mismatch: got {got.dtype}, expected torch.int32"
+    expected = lwd_probe_frame(peer, connection_id, channel, device=str(got.device))
+    got_values = _lwd_probe_values(got)
+    expected_values = _lwd_probe_values(expected)
     problems = [
-        f"[{i}] {_LWD_PROBE_FIELD_NAMES[i]}: got {got_vals[i]}, expected {exp_vals[i]}"
-        for i in range(_LWD_PROBE_FRAME_NUM_ELEMENTS)
-        if got_vals[i] != exp_vals[i]
+        f"[{index}] {_LWD_PROBE_FIELD_NAMES[index]}: got {got_values[index]}, expected {expected_values[index]}"
+        for index in range(_LWD_PROBE_FRAME_NUM_ELEMENTS)
+        if got_values[index] != expected_values[index]
     ]
     return "; ".join(problems)
-
-
-def lwd_probe_aggregate(local_ok: bool, group: dist.ProcessGroup) -> bool:
-    """All-reduce (MIN) the local verdict: one failure fails every rank.
-
-    Runs over the CPU/gloo group, never through the HCCL channels under
-    test, so the verdict cannot be blocked by the failure it reports.
-    """
-    verdict = torch.tensor([1 if local_ok else 0], dtype=torch.int32)
-    dist.all_reduce(verdict, op=dist.ReduceOp.MIN, group=group)
-    return bool(verdict.item())

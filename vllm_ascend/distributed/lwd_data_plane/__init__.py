@@ -1,7 +1,7 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 """LWD edge-cloud data plane.
 
-Two physical channels per DP connection, direction-only (no per-type
+Two physical channels per ``LwdConnectionId``, direction-only (no per-type
 channels):
 
     UP   edge -> cloud : prompt embeddings of one prefill batch, plus an

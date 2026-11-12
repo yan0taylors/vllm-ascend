@@ -125,7 +125,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
 
     def _lwd_submit_up_send(self, request: LwdTransferRequest) -> None:
         future = self.worker.comm_service.submit_send(request)
-        pending = self._lwd_up_send_inflight.setdefault(request.dp_idx, deque())
+        pending = self._lwd_up_send_inflight.setdefault(request.connection_id.dp_idx, deque())
         pending.append((request.seqno, future))
 
     def _lwd_pop_completed_up_sends(self) -> None:
@@ -186,7 +186,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
     ) -> ModelRunnerOutput:
         model = self.get_model()
         if not batch_meta.token_ids:
-            return self._lwd_watermarked_output(batch_meta.dp_idx)
+            return self._lwd_watermarked_output(batch_meta.connection_id.dp_idx)
 
         # Flatten all requests' prompt tokens into one batch (order = req_ids).
         flat_token_ids = [tid for token_ids in batch_meta.token_ids for tid in token_ids]
@@ -228,7 +228,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             channel=LwdChannelType.UP,
             op="send",
             num_elements=payload.numel(),
-            dp_idx=batch_meta.dp_idx,
+            connection_id=batch_meta.connection_id,
             tensor=payload,
             seqno=seqno,
         )
@@ -246,7 +246,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             (time.monotonic() - _t0) * 1000,
             len(flat_token_ids),
         )
-        return self._lwd_watermarked_output(batch_meta.dp_idx)
+        return self._lwd_watermarked_output(batch_meta.connection_id.dp_idx)
 
     @torch.inference_mode()
     def execute_lwd_unembed(self, seqno: int, batch_meta: LwdUnembedBatch) -> ModelRunnerOutput:
@@ -260,7 +260,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
                 channel=LwdChannelType.DOWN,
                 op="recv",
                 num_elements=batch_meta.recv_num_elements,  # int = rows_total * hidden_size
-                dp_idx=batch_meta.dp_idx,
+                connection_id=batch_meta.connection_id,
                 seqno=seqno,
             )
         )

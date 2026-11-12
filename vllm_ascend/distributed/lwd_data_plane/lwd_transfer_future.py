@@ -91,6 +91,10 @@ class LwdTransferFuture:
     def request(self) -> LwdTransferRequest:
         return self._request
 
+    @property
+    def _context(self) -> str:
+        return f"connection={self._request.connection_id} channel={self._request.channel.value} op={self._request.op}"
+
     def done(self) -> bool:
         """Pure CPU query; never blocks, never touches the device."""
         with self._lock:
@@ -99,13 +103,12 @@ class LwdTransferFuture:
             event = self._done_event
         if event is None:
             return False
+        return self._query_completion(event)
+
+    def _query_completion(self, event: torch.npu.Event) -> bool:
         try:
-            if event.query():
-                with self._lock:
-                    if self._status is LwdTransferStatus.PENDING:
-                        self._status = LwdTransferStatus.OK
-                        self._done_cond.notify_all()
-                return True
+            if not event.query():
+                return False
         except Exception as exc:  # device error surfaces as ERROR
             with self._lock:
                 if self._status is LwdTransferStatus.PENDING:
@@ -113,7 +116,30 @@ class LwdTransferFuture:
                     self._error = exc
                     self._done_cond.notify_all()
             return True
-        return False
+        with self._lock:
+            if self._status is LwdTransferStatus.PENDING:
+                self._status = LwdTransferStatus.OK
+            self._done_cond.notify_all()
+        return True
+
+    def _ready_to_reap(self) -> bool:
+        """Return whether device-owned resources are safe to release."""
+        with self._lock:
+            event = self._done_event
+            status = self._status
+        if event is None:
+            return status is not LwdTransferStatus.PENDING
+        return self._query_completion(event)
+
+    def _wait_for_device(self, timeout: float | None = None) -> None:
+        """Wait for safe reclamation even after a terminal abort error."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not self._ready_to_reap():
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError(f"lwd-comm device wait timed out on {self._context} seqno={self._request.seqno}")
+            with self._done_cond:
+                self._done_cond.wait(timeout=min(0.001, remaining or 0.001))
 
     def wait(self, timeout: float | None = None) -> LwdTransferResult:
         """Block until completion (readiness-gate path)."""
@@ -125,9 +151,7 @@ class LwdTransferFuture:
                     remaining = None if deadline is None else deadline - time.monotonic()
                     if remaining is not None and remaining <= 0:
                         raise TimeoutError(
-                            f"lwd-comm wait timed out (unbound) on "
-                            f"{self._request.channel.value} seqno="
-                            f"{self._request.seqno}"
+                            f"lwd-comm wait timed out (unbound) on {self._context} seqno={self._request.seqno}"
                         )
                     self._done_cond.wait(timeout=remaining or 0.001)
                     continue
@@ -136,13 +160,11 @@ class LwdTransferFuture:
                     break
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
-                    raise TimeoutError(
-                        f"lwd-comm wait timed out on {self._request.channel.value} seqno={self._request.seqno}"
-                    )
+                    raise TimeoutError(f"lwd-comm wait timed out on {self._context} seqno={self._request.seqno}")
                 self._done_cond.wait(timeout=min(0.001, remaining or 0.001))
             if self._status is LwdTransferStatus.ERROR:
                 raise RuntimeError(
-                    f"lwd-comm op failed on {self._request.channel.value} seqno={self._request.seqno}"
+                    f"lwd-comm op failed on {self._context} seqno={self._request.seqno}"
                 ) from self._error
         return LwdTransferResult(
             status=self._status,
@@ -162,9 +184,7 @@ class LwdTransferFuture:
                 self._error,
             )
         if status is LwdTransferStatus.ERROR:
-            raise RuntimeError(
-                f"lwd-comm op failed on {self._request.channel.value} seqno={self._request.seqno}"
-            ) from error
+            raise RuntimeError(f"lwd-comm op failed on {self._context} seqno={self._request.seqno}") from error
         return LwdTransferResult(status=status, tensor=tensor, aux_tensor=aux_tensor)
 
     # ------------------------------------------------------------------ #
@@ -207,6 +227,15 @@ class LwdTransferFuture:
     # ------------------------------------------------------------------ #
     # Lifecycle                                                           #
     # ------------------------------------------------------------------ #
+
+    def _fail(self, error: BaseException) -> None:
+        """Report a terminal error without releasing in-flight device state."""
+        with self._done_cond:
+            if self._finalized:
+                return
+            self._status = LwdTransferStatus.ERROR
+            self._error = error
+            self._done_cond.notify_all()
 
     def _finalize(self, error: BaseException | None = None) -> None:
         """Exactly-once terminal bookkeeping: release the send keepalive.
