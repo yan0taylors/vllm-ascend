@@ -227,8 +227,6 @@ class LwdCloudWorker(LwdWorkerBase):
         self._early_recv_rr = 0
         self._early_recv_lock = threading.Lock()
         self._lwd_stager: LwdHostStager | None = None
-        self._irecv_hint_mq = None
-        self._irecv_done_mq = None
         self._irecv_hint_mqs: dict[ConnectionId, Any] = {}
         self._irecv_done_mqs: dict[ConnectionId, Any] = {}
         self._lwd_early_recv_thread: threading.Thread | None = None
@@ -278,17 +276,16 @@ class LwdCloudWorker(LwdWorkerBase):
         connections = getattr(self, "_lwd_early_recv_connections", ())
         for connection in connections:
             self._irecv_hint_mqs[connection] = attach_hint_mq(connection)
-            self._irecv_done_mqs[connection] = create_report_mq(connection)
-        default = connections[0]
-        self._irecv_hint_mq = self._irecv_hint_mqs[default]
-        self._irecv_done_mq = self._irecv_done_mqs[default]
+            self._irecv_done_mqs[connection] = create_report_mq()
         # The engine fetches this MQ's handle through
         # lwd_early_recv_done_handle over collective_rpc once the executor
         # is up, so the vllm executor stays free of LWD plumbing.
         lwd_logger.info(
             "[Lwd][pre-recv] comm thread starting rank=%d hint MQ=%s",
             self.rank,
-            "attached" if self._irecv_hint_mq is not None else "none",
+            "attached"
+            if any(mq is not None for mq in self._irecv_hint_mqs.values())
+            else "none",
         )
         self._lwd_early_recv_thread = threading.Thread(
             target=self._lwd_early_recv_loop,
@@ -297,9 +294,11 @@ class LwdCloudWorker(LwdWorkerBase):
         )
         self._lwd_early_recv_thread.start()
 
-    def lwd_early_recv_done_handle(self, connection_id: ConnectionId | None = None) -> Handle | None:
+    def lwd_early_recv_done_handle(
+        self, connection_id: ConnectionId
+    ) -> Handle | None:
         """Handle of one connection's done MQ, for the engine reader."""
-        done_mq = self._irecv_done_mqs.get(connection_id) if connection_id is not None else self._irecv_done_mq
+        done_mq = self._irecv_done_mqs.get(connection_id)
         if done_mq is None:
             return None
         return done_mq.export_handle()
@@ -322,10 +321,15 @@ class LwdCloudWorker(LwdWorkerBase):
             "[Lwd][pre-recv] comm thread up rank=%d device=%s hint MQ=%s",
             self.rank,
             self.device,
-            "attached" if self._irecv_hint_mq is not None else "none",
+            "attached"
+            if any(mq is not None for mq in self._irecv_hint_mqs.values())
+            else "none",
         )
-        hint_mqs = self._irecv_hint_mqs or {ConnectionId(0, 0, 0): self._irecv_hint_mq}
-        hint_mqs = {connection: mq for connection, mq in hint_mqs.items() if mq is not None}
+        hint_mqs = {
+            connection: mq
+            for connection, mq in self._irecv_hint_mqs.items()
+            if mq is not None
+        }
         while not self._lwd_early_recv_stop.is_set():
             for connection, hint_mq in hint_mqs.items():
                 if connection in self._early_recv_failed_connections:
@@ -342,7 +346,9 @@ class LwdCloudWorker(LwdWorkerBase):
                 self._report_irecv_completions()
             except Exception as exc:
                 key = self._early_recv_current_key
-                connection = key[0] if key is not None else ConnectionId(0, 0, 0)
+                if key is None:
+                    raise
+                connection = key[0]
                 self._lwd_fail_early_recv_connection(connection, self._early_recv_error_seqno(connection), exc)
             if hint_mqs and all(connection in self._early_recv_failed_connections for connection in hint_mqs):
                 return
@@ -397,7 +403,7 @@ class LwdCloudWorker(LwdWorkerBase):
         except Exception:
             lwd_logger.exception("[Lwd][pre-recv] failed to clean data plane connection=%s", connection)
         lwd_logger.exception("[Lwd][pre-recv] connection failed connection=%s seqno=%d", connection, seqno)
-        done_mq = self._irecv_done_mqs.get(connection, self._irecv_done_mq)
+        done_mq = self._irecv_done_mqs.get(connection)
         if done_mq is not None:
             try:
                 done_mq.enqueue((connection, "error", seqno, repr(exc)))
@@ -408,43 +414,26 @@ class LwdCloudWorker(LwdWorkerBase):
                     seqno,
                 )
 
-    def _lwd_notify_early_recv_error(self, exc: Exception) -> None:
-        """Compatibility entry point for a failure on the current connection."""
-        key = self._early_recv_current_key
-        connection = key[0] if key is not None else ConnectionId(0, 0, 0)
-        self._lwd_fail_early_recv_connection(connection, key[2] if key is not None else -1, exc)
-
     def start_early_irecv(
         self,
         hint: dict[str, Any],
-        connection_id: ConnectionId | None = None,
+        connection_id: ConnectionId,
     ) -> None:
         """Queue one validated UP hint and submit it when capacity allows."""
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import hint_fields
 
         fields = hint_fields(hint)
-        if fields is None or hint.get("channel") is not LwdChannelType.UP:
-            connection = connection_id
-            if connection is None and isinstance(hint, dict):
-                raw_connection = hint.get("connection_id")
-                if isinstance(raw_connection, ConnectionId):
-                    connection = raw_connection
-                else:
-                    try:
-                        connection = ConnectionId(
-                            int(hint.get("edge_id", 0)),
-                            int(hint.get("cloud_id", 0)),
-                            int(hint.get("dp_idx", 0)),
-                        )
-                    except (TypeError, ValueError):
-                        pass
-            connection = connection or ConnectionId(0, 0, 0)
+        if (
+            fields is None
+            or fields.connection != connection_id
+            or hint.get("channel") is not LwdChannelType.UP
+        ):
             try:
                 seqno = int(hint.get("seqno", -1)) if isinstance(hint, dict) else -1
             except (TypeError, ValueError):
                 seqno = -1
             self._lwd_fail_early_recv_connection(
-                connection,
+                connection_id,
                 seqno,
                 ValueError(f"malformed UP receive hint: {hint!r}"),
             )
@@ -604,7 +593,7 @@ class LwdCloudWorker(LwdWorkerBase):
             connection, channel, seqno = key
             if connection in blocked or connection in self._early_recv_failed_connections:
                 continue
-            done_mq = self._irecv_done_mqs.get(connection, self._irecv_done_mq)
+            done_mq = self._irecv_done_mqs.get(connection)
             self._early_recv_current_key = key
             try:
                 if done_mq is None:

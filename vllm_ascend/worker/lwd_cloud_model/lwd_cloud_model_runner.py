@@ -728,6 +728,32 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             windows.append(LwdUpWindow(connection, dev, win_idx, connection_plan))
         return windows
 
+    def _lwd_request_connection(self, req_id: str) -> ConnectionId:
+        """Resolve one request's UP/DOWN connection without a default route.
+
+        Prefers the stamp recorded at harvest time. A fully prefix-cached
+        request never enters a prompt window and is therefore never stamped;
+        resolve it from its canonical edge identity instead of falling back
+        to an arbitrary connection, which would send the hidden packet to
+        the wrong edge (or drop it) in a multi-edge batch.
+        """
+        stamped = getattr(self, "_lwd_request_connections", {}).get(req_id)
+        if stamped is not None:
+            return stamped
+        connections = (
+            getattr(self.worker, "_lwd_connections", ())
+            if self.worker is not None
+            else ()
+        )
+        edge_id, _ = parse_edge_id(req_id)
+        candidates = [c for c in connections if c.edge_id == edge_id]
+        if len(candidates) != 1:
+            raise RuntimeError(
+                f"[LWD][cloud-runner] req={req_id} has no unique local "
+                f"connection for edge {edge_id}"
+            )
+        return candidates[0]
+
     def _lwd_prompt_plan(self, num_scheduled_tokens: np.ndarray) -> list[LwdPromptWindow]:
         """Derive prompt-only rows from native request order and watermarks."""
         plan: list[LwdPromptWindow] = []
@@ -1089,14 +1115,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         # (same batch order as logits/hidden); the live input_batch is
         # never read here
         valid = ~discard_mask_np[: len(batch_req_ids)]
-        request_connections = getattr(self, "_lwd_request_connections", {})
-        worker_connections = getattr(self.worker, "_lwd_connections", ()) if self.worker is not None else ()
-        default = worker_connections[0] if len(worker_connections) == 1 else ConnectionId(0, 0, 0)
-        groups = sorted({request_connections.get(req_id, default) for req_id in batch_req_ids})
+        groups = sorted({self._lwd_request_connection(req_id) for req_id in batch_req_ids})
         payloads: list[LwdDownPayload] = []
         for connection in groups:
             group_valid = valid & np.asarray(
-                [request_connections.get(req_id, default) == connection for req_id in batch_req_ids],
+                [self._lwd_request_connection(req_id) == connection for req_id in batch_req_ids],
                 dtype=np.bool_,
             )
             if spec_decode_metadata is None:

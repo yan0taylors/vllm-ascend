@@ -210,19 +210,6 @@ class LwdReqEmbed:
             )
         self.consumed = to_rows
 
-    def skip_consumed(self, to_rows: int) -> None:
-        """Skip rows covered by a re-admission prefix-cache hit."""
-        if to_rows < self.consumed or to_rows > self.recv_rows:
-            raise LwdHostStageGeometryError(
-                f"req={self.req_id}: skip target {to_rows} outside "
-                f"[consumed={self.consumed}, recv_rows={self.recv_rows}]"
-            )
-        if to_rows > self.prompt_rows:
-            raise LwdHostStageGeometryError(
-                f"req={self.req_id}: skip target {to_rows} exceeds prompt_rows={self.prompt_rows}"
-            )
-        self.consumed = to_rows
-
     def mark_aborted(self) -> None:
         self.aborted = True
 

@@ -59,24 +59,17 @@ def make_recv_hint(
     num_tokens: int,
     aux_rows: int = 0,
     *,
+    connection_id: ConnectionId,
     req_ids: list[str],
     rows: list[int],
     prompt_offsets: list[int],
     prompt_lens: list[int],
     refills: list[bool] | None = None,
     prefix_nonces: list[int] | None = None,
-    connection_id: ConnectionId | None = None,
-    edge_id: int = 0,
-    cloud_id: int = 0,
-    dp_idx: int = 0,
 ) -> dict[str, Any]:
     """Build one UP hint with the complete per-request chunk geometry."""
-    connection = connection_id or ConnectionId(edge_id, cloud_id, dp_idx)
     return {
-        "connection_id": connection,
-        "edge_id": connection.edge_id,
-        "cloud_id": connection.cloud_id,
-        "dp_idx": connection.dp_idx,
+        "connection_id": connection_id,
         "channel": LwdChannelType.UP,
         "seqno": int(seqno),
         "num_tokens": int(num_tokens),
@@ -101,12 +94,6 @@ def hint_fields(hint: dict[str, Any]) -> LwdRecvHintFields | None:
         return None
     try:
         connection = hint.get("connection_id")
-        if connection is None:
-            connection = ConnectionId(
-                int(hint.get("edge_id", 0)),
-                int(hint.get("cloud_id", 0)),
-                int(hint.get("dp_idx", 0)),
-            )
         if not isinstance(connection, ConnectionId):
             return None
         fields = LwdRecvHintFields(
@@ -194,20 +181,19 @@ def _hint_env_key(connection: ConnectionId) -> str:
     return f"{LWD_RECV_HINT_MQ_ENV}_E{connection.edge_id}C{connection.cloud_id}D{connection.dp_idx}"
 
 
-def create_hint_mq(connection_id: ConnectionId | None = None) -> MessageQueue:
+def create_hint_mq(connection_id: ConnectionId) -> MessageQueue:
     """Engine side: create the hint MQ (writer) and export the handle to
     the environment.
 
     Must be called before workers are created (they rebuild the reader
     from the env at startup); both fork and spawn inherit via env vars.
     """
-    connection = connection_id or ConnectionId(0, 0, 0)
     mq = _new_sideband_mq()
-    os.environ[_hint_env_key(connection)] = _encode_handle(mq.export_handle())
+    os.environ[_hint_env_key(connection_id)] = _encode_handle(mq.export_handle())
     return mq
 
 
-def attach_hint_mq(connection_id: ConnectionId | None = None) -> MessageQueue | None:
+def attach_hint_mq(connection_id: ConnectionId) -> MessageQueue | None:
     """Worker side: rebuild the hint MQ reader from the handle in the
     environment.
 
@@ -215,8 +201,7 @@ def attach_hint_mq(connection_id: ConnectionId | None = None) -> MessageQueue | 
     comm thread still runs reporting, so a missing hint only delays the
     early recv, never stalls the watermark.
     """
-    connection = connection_id or ConnectionId(0, 0, 0)
-    raw = os.environ.get(_hint_env_key(connection))
+    raw = os.environ.get(_hint_env_key(connection_id))
     if raw is None:
         return None
     from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
@@ -224,7 +209,7 @@ def attach_hint_mq(connection_id: ConnectionId | None = None) -> MessageQueue | 
     return MessageQueue.create_from_handle(_decode_handle(raw), 0)
 
 
-def create_report_mq(connection_id: ConnectionId | None = None) -> MessageQueue:
+def create_report_mq() -> MessageQueue:
     """Worker side: create the done MQ (writer); the engine fetches its
     handle over ``collective_rpc`` once the executor is up."""
     return _new_sideband_mq()
@@ -233,7 +218,6 @@ def create_report_mq(connection_id: ConnectionId | None = None) -> MessageQueue:
 # ---------------------------------------------------------------------- #
 # Scheduler process side: hint dispatch + completion watermark           #
 # ---------------------------------------------------------------------- #
-_hint_sender: Callable[[dict[str, Any]], None] | None = None
 _hint_senders: dict[ConnectionId, Callable[[dict[str, Any]], None]] = {}
 _watermarks: dict[tuple[ConnectionId, LwdChannelType], int] = {}
 _lock = threading.Lock()
@@ -241,39 +225,29 @@ _lock = threading.Lock()
 
 def register_hint_sender(
     sender: Callable[[dict[str, Any]], None],
-    connection_id: ConnectionId | None = None,
+    connection_id: ConnectionId,
 ) -> None:
-    """Install the transport used to dispatch hints (once per engine
-    process).
+    """Install the reliable hint transport for one engine connection.
 
-    The closure passed in must **deliver reliably** (enqueue the hint
-    into the hint MQ): with the gate on, hints are a correctness
-    dependency — lose one and that recv is never pre-posted, the
-    watermark stalls, and the gated batch is never dispatched.
+    Losing a hint leaves its receive unposted and stalls the watermark.
     """
-    global _hint_sender
-    if connection_id is None:
-        _hint_sender = sender
-    else:
-        _hint_senders[connection_id] = sender
+    _hint_senders[connection_id] = sender
 
 
 def post_irecv_hint(hint: dict[str, Any]) -> None:
-    """Send one recv hint to the local worker's comm thread.
-
-    The healthy path logs nothing (the caller ``lwd_cloud_engine`` logs
-    ``HINT ...``): this module keeps only should-never-happen diagnostics,
-    and they must be visible in the logs.
-    """
+    """Send one validated recv hint to its connection's comm thread."""
     fields = hint_fields(hint)
-    sender = _hint_senders.get(fields.connection) if fields is not None else None
-    sender = sender or _hint_sender
+    if fields is None:
+        raise ValueError(f"[LWD] malformed early-recv hint: {hint!r}")
+    sender = _hint_senders.get(fields.connection)
     if sender is None:
-        # The engine registers the sender during startup, before it accepts
-        # any edge message, so a missing one is a wiring error; dropping the
-        # hint would stall the pre-recv gate forever (nobody would pre-post
-        # that recv, the watermark would never advance).
-        raise RuntimeError(f"[LWD] early-recv hint for seqno {hint.get('seqno')} has no registered sender")
+        # The engine registers every sender during startup, before accepting
+        # edge messages. Never substitute another connection's sender: losing
+        # or misrouting the hint would stall the pre-recv gate forever.
+        raise RuntimeError(
+            f"[LWD] early-recv hint for {fields.connection} seqno "
+            f"{fields.seqno} has no registered sender"
+        )
     sender(hint)
 
 
@@ -284,17 +258,11 @@ def record_irecv_completions(
     advanced: list[tuple] = []
     with _lock:
         for item in items:
-            if len(item) == 2:
-                channel, seqno = item
-                connection = ConnectionId(0, 0, 0)
-                advanced_item = (channel, seqno)
-            else:
-                connection, channel, seqno = item
-                advanced_item = item
+            connection, channel, seqno = item
             key = (connection, channel)
             if seqno > _watermarks.get(key, -1):
                 _watermarks[key] = seqno
-                advanced.append(advanced_item)
+                advanced.append(item)
     return advanced
 
 
