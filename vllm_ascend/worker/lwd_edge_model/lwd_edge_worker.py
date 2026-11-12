@@ -47,6 +47,18 @@ class LwdEdgeWorker(LwdWorkerBase):
             self.rank,
         )
 
+    def shutdown(self) -> None:
+        """Release channel FIFOs and HCCL groups before native teardown."""
+        try:
+            self.comm_service.shutdown(timeout=5.0)
+            from vllm_ascend.distributed.lwd_data_plane.lwd_channels import (
+                lwd_destroy_channels,
+            )
+
+            lwd_destroy_channels()
+        finally:
+            super().shutdown()
+
     def compile_or_warm_up_model(self) -> CompilationTimes:
         # The LWD edge's runtime forward is hijacked by the LWD flow
         # (execute_model only dispatches to the runner's embed/unembed

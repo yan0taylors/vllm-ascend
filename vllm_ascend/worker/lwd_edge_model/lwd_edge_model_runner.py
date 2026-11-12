@@ -22,7 +22,12 @@ from vllm.v1.core.sched.output import LwdEmbedBatch, LwdUnembedBatch
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import LwdTransferFuture
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType, LwdTransferRequest
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import (
+    ConnectionId,
+    LwdChannelType,
+    LwdTransferRequest,
+    connection_from,
+)
 from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import LwdBaseModelRunner
 from vllm_ascend.worker.lwd_edge_model.lwd_edge_mm_cache import LwdEdgeMmCache
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import pack_hash_payload
@@ -60,8 +65,8 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         super().__init__(vllm_config, device, worker)
         self.mm_cache = LwdEdgeMmCache()
         self.tid2eid_tables: list[torch.Tensor] = []
-        self._lwd_up_send_inflight: dict[int, deque[tuple[int, LwdTransferFuture]]] = {}
-        self._lwd_up_send_watermarks: dict[int, int] = {}
+        self._lwd_up_send_inflight: dict[ConnectionId, deque[tuple[int, LwdTransferFuture]]] = {}
+        self._lwd_up_send_watermarks: dict[ConnectionId, int] = {}
 
     def load_model(self) -> None:
         """Load the edge model and read the CPU Hash routing tables for
@@ -125,27 +130,29 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
 
     def _lwd_submit_up_send(self, request: LwdTransferRequest) -> None:
         future = self.worker.comm_service.submit_send(request)
-        pending = self._lwd_up_send_inflight.setdefault(request.dp_idx, deque())
+        pending = self._lwd_up_send_inflight.setdefault(request.connection, deque())
         pending.append((request.seqno, future))
 
     def _lwd_pop_completed_up_sends(self) -> None:
-        """Advance each DP watermark only across its successful FIFO prefix."""
-        for dp_idx, pending in self._lwd_up_send_inflight.items():
+        """Advance each connection watermark across its successful FIFO prefix."""
+        for connection, pending in self._lwd_up_send_inflight.items():
             while pending and pending[0][1].done():
                 seqno, future = pending[0]
                 future.result()
                 pending.popleft()
-                self._lwd_up_send_watermarks[dp_idx] = seqno
+                self._lwd_up_send_watermarks[connection] = seqno
 
-    def _lwd_watermarked_output(self, dp_idx: int | None = None) -> ModelRunnerOutput:
+    def _lwd_watermarked_output(self, connection: ConnectionId | int | None = None) -> ModelRunnerOutput:
         self._lwd_pop_completed_up_sends()
-        if dp_idx is None:
+        if isinstance(connection, int):
+            connection = ConnectionId(0, 0, connection)
+        if connection is None:
             watermarks = {
-                known_dp_idx: self._lwd_up_send_watermarks.get(known_dp_idx, -1)
-                for known_dp_idx in self._lwd_up_send_inflight
+                known: self._lwd_up_send_watermarks.get(known, -1)
+                for known in self._lwd_up_send_inflight
             }
         else:
-            watermarks = {dp_idx: self._lwd_up_send_watermarks.get(dp_idx, -1)}
+            watermarks = {connection: self._lwd_up_send_watermarks.get(connection, -1)}
         return ModelRunnerOutput(
             req_ids=[],
             req_id_to_index={},
@@ -185,8 +192,9 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         scheduler_output: SchedulerOutput,
     ) -> ModelRunnerOutput:
         model = self.get_model()
+        connection = connection_from(batch_meta)
         if not batch_meta.token_ids:
-            return self._lwd_watermarked_output(batch_meta.dp_idx)
+            return self._lwd_watermarked_output(connection)
 
         # Flatten all requests' prompt tokens into one batch (order = req_ids).
         flat_token_ids = [tid for token_ids in batch_meta.token_ids for tid in token_ids]
@@ -228,7 +236,9 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             channel=LwdChannelType.UP,
             op="send",
             num_elements=payload.numel(),
-            dp_idx=batch_meta.dp_idx,
+            dp_idx=connection.dp_idx,
+            edge_id=connection.edge_id,
+            cloud_id=connection.cloud_id,
             tensor=payload,
             seqno=seqno,
         )
@@ -246,11 +256,12 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             (time.monotonic() - _t0) * 1000,
             len(flat_token_ids),
         )
-        return self._lwd_watermarked_output(batch_meta.dp_idx)
+        return self._lwd_watermarked_output(connection)
 
     @torch.inference_mode()
     def execute_lwd_unembed(self, seqno: int, batch_meta: LwdUnembedBatch) -> ModelRunnerOutput:
         model = self.get_model()
+        connection = connection_from(batch_meta)
         if not batch_meta.req_ids:
             return self._lwd_watermarked_output()
 
@@ -260,7 +271,9 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
                 channel=LwdChannelType.DOWN,
                 op="recv",
                 num_elements=batch_meta.recv_num_elements,  # int = rows_total * hidden_size
-                dp_idx=batch_meta.dp_idx,
+                dp_idx=connection.dp_idx,
+                edge_id=connection.edge_id,
+                cloud_id=connection.cloud_id,
                 seqno=seqno,
             )
         )
@@ -268,6 +281,11 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         # wait_on_current_stream: device-ordered wait; the host never blocks
         recv_future.wait_on_current_stream()
         result = recv_future.result()
+        # The receive tensor was allocated on the channel stream but is
+        # consumed by lm_head on the compute stream. Keep its allocation
+        # alive until that stream's work completes, including after the
+        # future and its local result leave scope.
+        result.tensor.record_stream(torch.npu.current_stream())
         _t_tensor = time.monotonic()
         hidden_size = self.model_config.get_hidden_size()
         hidden_states = result.tensor.view(-1, hidden_size)  # (rows_total, H)
