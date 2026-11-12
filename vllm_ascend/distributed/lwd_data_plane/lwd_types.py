@@ -7,6 +7,20 @@ import enum
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from vllm.config.lwd.topology import LwdConnectionId as ConnectionId
+
+
+def connection_from(metadata: Any) -> ConnectionId:
+    """Read canonical batch identity, falling back at the legacy boundary."""
+    connection = getattr(metadata, "connection_id", None)
+    if connection is not None:
+        return connection
+    return ConnectionId(
+        getattr(metadata, "edge_id", 0),
+        getattr(metadata, "cloud_id", 0),
+        getattr(metadata, "dp_idx", 0),
+    )
+
 
 class LwdChannelType(enum.Enum):
     """The two physical data-plane channels, direction-only.
@@ -42,10 +56,12 @@ class LwdTransferRequest:
     # 32 + R*(H+3K)).  recv: used to allocate the exact-size buffer
     # (HCCL P2P requires matching numel on both ends).
     num_elements: int
-    # DP connection this transfer belongs to; the edge serves several
-    # connections, so its channel choice is per transfer. Defaults to 0
-    # and keeps single-connection behaviour.
+    # Connection this transfer belongs to. The three fields remain separate
+    # for compatibility with the current vLLM batch metadata; new callers
+    # should treat ``connection`` as the single routing identity.
     dp_idx: int = 0
+    edge_id: int = 0
+    cloud_id: int = 0
     # send: payload tensor (snapshotted into a communication-owned buffer
     # at submit time).  recv: None.
     tensor: Any | None = None
@@ -85,6 +101,10 @@ class LwdTransferRequest:
     # recv: optional segmented D2H destinations. Each tuple contains a pinned
     # host view, a flat source element offset, and the number of elements.
     stage_segments: list[tuple[Any, int, int]] | None = None
+
+    @property
+    def connection(self) -> ConnectionId:
+        return ConnectionId(self.edge_id, self.cloud_id, self.dp_idx)
 
 
 @dataclass
