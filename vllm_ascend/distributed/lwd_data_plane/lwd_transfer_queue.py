@@ -31,7 +31,7 @@ from vllm.logger import logger
 
 from vllm_ascend.distributed.lwd_data_plane import lwd_channels
 from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import LwdTransferFuture
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType, LwdTransferRequest
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId, LwdChannelType, LwdTransferRequest
 
 
 def _lwd_scramble_seed_for(request: LwdTransferRequest) -> int | None:
@@ -59,8 +59,9 @@ def _lwd_scramble_seed_for(request: LwdTransferRequest) -> int | None:
 class LwdTransferQueue:
     """One FIFO of pending requests for one DP connection, channel and op."""
 
-    def __init__(self, dp_idx: int, channel_type: LwdChannelType, op: str) -> None:
-        self.dp_idx = dp_idx
+    def __init__(self, dp_idx: int | ConnectionId, channel_type: LwdChannelType, op: str) -> None:
+        self.connection = dp_idx if isinstance(dp_idx, ConnectionId) else ConnectionId(dp_idx=dp_idx)
+        self.dp_idx = self.connection.dp_idx
         self.channel_type = channel_type
         self.op = op  # one FIFO carries exactly one direction's seqno stream
         self._pending: deque[LwdTransferFuture] = deque()
@@ -74,6 +75,7 @@ class LwdTransferQueue:
         # requests).  Skipped when advancing so one abort cannot wedge
         # every later request on this channel.
         self._skipped: set[int] = set()
+        self._abort_error: BaseException | None = None
 
     # ------------------------------------------------------------------ #
     # Abort holes                                                         #
@@ -123,6 +125,10 @@ class LwdTransferQueue:
         if request.op == "send":
             request = self._snapshot_send(request)
         with self._submission_lock:
+            if self._abort_error is not None:
+                raise RuntimeError(
+                    f"channel {self.channel_type.value} {self.op} is aborted for connection {self.connection}"
+                ) from self._abort_error
             if request.seqno is not None:
                 return self._submit_sequenced(request)
             return self._execute_next(request)
@@ -192,13 +198,15 @@ class LwdTransferQueue:
             return future
         future = self._execute_next(request)
         self._next_seqno += 1
-        # TODO(lwd): confirm whether this drain should also step over skipped
-        # seqnos, as _advance_past_skipped does: a held seqno right after a
-        # skipped one is only posted on the next submit or skip_seqno call.
+        # Drain both held requests and skipped holes. Otherwise a held seqno
+        # immediately after an abort hole remains deferred until unrelated
+        # future traffic arrives.
+        self._advance_past_skipped()
         while self._next_seqno in self._held:
             held_request, held_future = self._held.pop(self._next_seqno)
             self._execute_next(held_request, into=held_future)
             self._next_seqno += 1
+            self._advance_past_skipped()
         return future
 
     def _execute_next(
@@ -228,6 +236,20 @@ class LwdTransferQueue:
         finalized = self._reap()
         self._finalize_many(finalized)
         return finalized
+
+    def abort(self, error: BaseException) -> None:
+        """Fail and forget this connection's posted and deferred transfers."""
+        with self._submission_lock:
+            self._abort_error = error
+            for _request, future in self._held.values():
+                future._finalize(error=error)
+            self._held.clear()
+            with self._lock:
+                pending = list(self._pending)
+                self._pending.clear()
+            for future in pending:
+                future._finalize(error=error)
+            self._skipped.clear()
 
     def shutdown(self, timeout: float | None = None) -> list[LwdTransferFuture]:
         """Wait for pending operations before releasing owned buffers."""
@@ -350,7 +372,12 @@ class LwdTransferQueue:
         return into
 
     def _stream(self) -> Any:
-        return lwd_channels.lwd_get_channel_stream(self.channel_type, self.dp_idx)
+        return lwd_channels.lwd_get_channel_stream(
+            self.channel_type,
+            self.dp_idx,
+            edge_id=self.connection.edge_id,
+            cloud_id=self.connection.cloud_id,
+        )
 
     def _copy_stream(self) -> torch.npu.Stream:
         stream = getattr(self, "_d2h_copy_stream", None)
@@ -395,10 +422,20 @@ class LwdTransferQueue:
             self._stream().wait_event(event)
 
     def _post_send(self, req: LwdTransferRequest) -> list[Any]:
-        group = lwd_channels.lwd_get_channel_device_group(self.channel_type, self.dp_idx)
+        group = lwd_channels.lwd_get_channel_device_group(
+            self.channel_type,
+            self.dp_idx,
+            edge_id=self.connection.edge_id,
+            cloud_id=self.connection.cloud_id,
+        )
         peer = req.peer_rank
         if peer is None:
-            peer = lwd_channels.lwd_get_channel_peer(self.channel_type, self.dp_idx)
+            peer = lwd_channels.lwd_get_channel_peer(
+                self.channel_type,
+                self.dp_idx,
+                edge_id=self.connection.edge_id,
+                cloud_id=self.connection.cloud_id,
+            )
         tensor = req.tensor
         assert tensor is not None
         logger.debug(
@@ -429,10 +466,20 @@ class LwdTransferQueue:
         return [dist.isend(tensor.contiguous(), dst=peer, group=group)]
 
     def _post_recv(self, req: LwdTransferRequest) -> tuple[torch.Tensor, torch.Tensor | None, list[Any]]:
-        group = lwd_channels.lwd_get_channel_device_group(self.channel_type, self.dp_idx)
+        group = lwd_channels.lwd_get_channel_device_group(
+            self.channel_type,
+            self.dp_idx,
+            edge_id=self.connection.edge_id,
+            cloud_id=self.connection.cloud_id,
+        )
         peer = req.peer_rank
         if peer is None:
-            peer = lwd_channels.lwd_get_channel_peer(self.channel_type, self.dp_idx)
+            peer = lwd_channels.lwd_get_channel_peer(
+                self.channel_type,
+                self.dp_idx,
+                edge_id=self.connection.edge_id,
+                cloud_id=self.connection.cloud_id,
+            )
         logger.debug(
             "[lwd-comm] RECV post channel=%s my_rank=%d src=%s group_ranks=%s num_elements=%d aux_elements=%d op=irecv",
             self.channel_type,

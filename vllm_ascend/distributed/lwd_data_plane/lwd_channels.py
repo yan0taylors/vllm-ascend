@@ -11,8 +11,7 @@ Owns the physical channels (UP edge->cloud, DOWN cloud->edge):
   * init-time warmup of every connection's channels in a fixed global
     order (moves the first-use HCCL rendezvous out of the pipeline, where
     the two sides could otherwise arrive on different channels and
-    deadlock); the warmup payload is an identity probe frame verified by
-    the receiver (see ``lwd_channel_probe``).
+    deadlock).
 
 In a single_instance topology the edge process serves every DP
 connection, so its endpoint rank holds the channel pairs of all of them;
@@ -23,8 +22,8 @@ Design: docs/design/lwd_data_plane.md in the vLLM repository.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum
+import threading
+import time
 
 import torch
 import torch.distributed as dist
@@ -33,18 +32,16 @@ from vllm.distributed.lwd import LwdChannelEndpoints, LwdParallelGroupsSpec
 from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import logger
 
-from vllm_ascend.distributed.lwd_data_plane.lwd_channel_probe import (
-    LWD_PROBE_TIMEOUT_S,
-    lwd_probe_aggregate,
-    lwd_probe_frame,
-    lwd_probe_verify,
-    lwd_probe_wait,
-)
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
+from vllm_ascend import envs
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId, LwdChannelType
 
-# (dp_idx, channel) -> (device_group, peer_global_rank), endpoint ranks only
-_LWD_CHANNEL_GROUPS: dict[tuple[int, LwdChannelType], tuple[dist.ProcessGroup, int]] = {}
-_LWD_CHANNEL_STREAMS: dict[tuple[int, LwdChannelType], torch.npu.Stream] = {}
+_LWD_WARMUP_NUM_ELEMENTS = 5
+_LWD_WIRE_MAGIC = 0x4C5744
+_LWD_WIRE_VERSION = 1
+
+# (connection, channel) -> (device_group, peer_global_rank), endpoint ranks only
+_LWD_CHANNEL_GROUPS: dict[tuple[ConnectionId, LwdChannelType], tuple[dist.ProcessGroup, int]] = {}
+_LWD_CHANNEL_STREAMS: dict[tuple[ConnectionId, LwdChannelType], torch.npu.Stream] = {}
 _LWD_ENDPOINTS: tuple[LwdChannelEndpoints, ...] = ()
 _LWD_CHANNELS_INITIALIZED = False
 
@@ -66,6 +63,7 @@ def lwd_init_channels() -> None:
     backend = dist.get_backend(get_world_group().device_group)
     my_rank = dist.get_rank()
     for endpoints in spec.channel_endpoints:
+        connection = endpoints.connection_id
         ranks = [endpoints.edge_rank, endpoints.cloud_rank]
         for channel in LwdChannelType:
             # Both channels span the same rank pair; the direction is given
@@ -73,8 +71,8 @@ def lwd_init_channels() -> None:
             group = dist.new_group(ranks, backend=backend)
             if my_rank in ranks:
                 peer = endpoints.cloud_rank if my_rank == endpoints.edge_rank else endpoints.edge_rank
-                _LWD_CHANNEL_GROUPS[(endpoints.dp_idx, channel)] = (group, peer)
-                _LWD_CHANNEL_STREAMS[(endpoints.dp_idx, channel)] = torch.npu.Stream()
+                _LWD_CHANNEL_GROUPS[(connection, channel)] = (group, peer)
+                _LWD_CHANNEL_STREAMS[(connection, channel)] = torch.npu.Stream()
     _LWD_ENDPOINTS = spec.channel_endpoints_of(my_rank)
     # The cloud-internal embeds broadcast does not build its own group: a
     # dedicated new_group delivered nothing under torch_npu in testing
@@ -95,184 +93,161 @@ def lwd_init_channels() -> None:
     lwd_warm_up_channels()
 
 
-class _ProbeOutcome(Enum):
-    """The three possible endings of one channel probe."""
+def _lwd_echo_handshake(endpoints: LwdChannelEndpoints, connection: ConnectionId, timeout_s: float) -> None:
+    """Bound the whole echo, including HCCL posting and D2H synchronization.
 
-    OK = "ok"
-    MISMATCH = "mismatch"  # op completed, frame wrong: keep probing
-    TIMEOUT = "timeout"  # channel wedged: stop posting ops
-
-
-@dataclass(frozen=True)
-class _ChannelProbeResult:
-    outcome: _ProbeOutcome
-    detail: str = ""
-
-
-def _lwd_probe_timeout_detail(dp_idx: int, channel: LwdChannelType, peer: int) -> str:
-    """Format the shared TIMEOUT detail for a channel probe."""
-    return f"[dp_idx={dp_idx} channel={channel.value}] probe TIMEOUT after {LWD_PROBE_TIMEOUT_S:g}s (peer={peer})"
-
-
-def _lwd_probe_channel(
-    group: dist.ProcessGroup,
-    peer: int,
-    dp_idx: int,
-    channel: LwdChannelType,
-    is_sender: bool,
-) -> _ChannelProbeResult:
-    """Post one probe op on a channel and check the result.
-
-    Returns one of three outcomes: ``OK``, ``MISMATCH`` (the op completed but
-    the frame is wrong -- keep probing), or ``TIMEOUT`` (the channel is wedged
-    -- stop posting ops).  The backend check runs before any op is posted, so
-    a degraded (gloo) group fails here instead of probing a non-HCCL link.
+    A timed-out HCCL operation cannot be cancelled safely. Startup must fail
+    and the process must be restarted rather than reusing this channel.
     """
-    backend = str(dist.get_backend(group))
-    if backend != "hccl":
-        raise RuntimeError(f"channel group backend must be hccl, got {backend}")
-    my_rank = dist.get_rank()
-    if is_sender:
-        # The frame is the identity proof; the sender only needs the op done.
-        payload = lwd_probe_frame(my_rank, dp_idx, channel)
-        handle = dist.isend(payload, dst=peer, group=group)
-        if not lwd_probe_wait(handle):
-            return _ChannelProbeResult(_ProbeOutcome.TIMEOUT, _lwd_probe_timeout_detail(dp_idx, channel, peer))
-        return _ChannelProbeResult(_ProbeOutcome.OK)
-    # Zero-filled buffer: a no-op irecv or a stale frame fails the [0] magic
-    # check (magic is 90, so an all-zero frame is never a legal one).
-    payload = torch.zeros_like(lwd_probe_frame(peer, dp_idx, channel))
-    handle = dist.irecv(payload, src=peer, group=group)
-    if not lwd_probe_wait(handle):
-        return _ChannelProbeResult(_ProbeOutcome.TIMEOUT, _lwd_probe_timeout_detail(dp_idx, channel, peer))
-    # The poll above only observed completion; the CPU must sync before
-    # reading the received buffer.
-    torch.npu.synchronize()
-    problem = lwd_probe_verify(payload, peer, dp_idx, channel)
-    if problem:
-        return _ChannelProbeResult(
-            _ProbeOutcome.MISMATCH,
-            f"[dp_idx={dp_idx} channel={channel.value}] frame mismatch (peer={peer}): {problem}",
+    done = threading.Event()
+    errors: list[BaseException] = []
+    phase = ["posting"]
+    device = torch.npu.current_device()
+
+    def run_echo() -> None:
+        try:
+            # NPU device selection is thread-local; do not fall back to card 0.
+            torch.npu.set_device(device)
+            _lwd_echo_handshake_impl(endpoints, connection, phase)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            done.set()
+
+    threading.Thread(target=run_echo, name=f"lwd-echo-{connection}", daemon=True).start()
+    if not done.wait(timeout_s * 2):
+        raise TimeoutError(
+            f"[LWD] channel handshake timed out after {timeout_s * 2}s: "
+            f"{connection}, rank {dist.get_rank()}, phase {phase[0]}; restart required"
         )
-    return _ChannelProbeResult(_ProbeOutcome.OK)
+    if errors:
+        raise RuntimeError(f"[LWD] channel handshake failed on {connection}: {errors[0]!r}") from errors[0]
+
+
+def _lwd_echo_handshake_impl(
+    endpoints: LwdChannelEndpoints, connection: ConnectionId, phase: list[str]
+) -> None:
+    my_rank = dist.get_rank()
+    up_group, up_peer = _LWD_CHANNEL_GROUPS[(connection, LwdChannelType.UP)]
+    down_group, down_peer = _LWD_CHANNEL_GROUPS[(connection, LwdChannelType.DOWN)]
+    expected = [
+        _LWD_WIRE_MAGIC,
+        _LWD_WIRE_VERSION,
+        connection.edge_id,
+        connection.cloud_id,
+        connection.dp_idx,
+    ]
+    if my_rank == endpoints.edge_rank:
+        send = torch.tensor(expected, dtype=torch.int32, device="npu")
+        recv = torch.zeros(_LWD_WARMUP_NUM_ELEMENTS, dtype=torch.int32, device="npu")
+        send_work = dist.isend(send, dst=up_peer, group=up_group)
+        recv_work = dist.irecv(recv, src=down_peer, group=down_group)
+        phase[0] = "UP send wait"
+        send_work.wait()
+        phase[0] = "DOWN receive wait"
+        recv_work.wait()
+    else:
+        recv = torch.zeros(_LWD_WARMUP_NUM_ELEMENTS, dtype=torch.int32, device="npu")
+        recv_work = dist.irecv(recv, src=up_peer, group=up_group)
+        phase[0] = "UP receive wait"
+        recv_work.wait()
+        phase[0] = "UP receive D2H"
+        received = [int(value) for value in recv.cpu().tolist()]
+        if received != expected:
+            raise RuntimeError(f"[LWD] channel identity/version mismatch on {connection}: expected {expected}, got {received}")
+        send_work = dist.isend(recv, dst=down_peer, group=down_group)
+        phase[0] = "DOWN echo send wait"
+        send_work.wait()
+    phase[0] = "echo verification D2H"
+    if not torch.equal(recv.cpu(), torch.tensor(expected, dtype=torch.int32)):
+        raise RuntimeError(f"[LWD] channel echo mismatch on {connection}: expected {expected}, got {recv.cpu().tolist()}")
 
 
 def lwd_warm_up_channels() -> None:
-    """Pre-establish and verify every connection's channel P2P links at init.
-
-    Each channel exchanges one identity probe frame over the existing
-    isend/irecv round-trip in the fixed global order (connection order, UP
-    then DOWN, zero added P2P); the receiver compares it field by field
-    against the frame it derives from the same public facts.  Failures are
-    aggregated over the CPU/gloo world group so every rank raises with the
-    same verdict instead of hanging on the 1836s HCCL timeout; non-endpoint
-    ranks only join the aggregation and the closing barrier.
-
-    Failure policy: a verify failure is recorded and probing continues --
-    the peer's op did complete, and HCCL P2P has no tags, so the op
-    count/order must stay invariant for later pairing.  A poll TIMEOUT
-    breaks at once (the peer's op cannot complete either, so it times out
-    symmetrically) and skips the rollback destroy, which could hang on a
-    wedged communicator and forfeit the fast fail; the platform restarts
-    the process.  An unexpected raise inside the channel probe is treated
-    the same way, because posting further ops on unknown state only
-    manufactures untraceable paths.
-    """
-    failures: list[str] = []
-    aborted = False
-    skipped: list[str] = []
-    if _LWD_ENDPOINTS:
-        my_rank = dist.get_rank()
-        planned = [
-            (endpoints, channel) for endpoints in _LWD_ENDPOINTS for channel in (LwdChannelType.UP, LwdChannelType.DOWN)
-        ]
-        for index, (endpoints, channel) in enumerate(planned):
-            group, peer = _LWD_CHANNEL_GROUPS[(endpoints.dp_idx, channel)]
-            sender = endpoints.edge_rank if channel is LwdChannelType.UP else endpoints.cloud_rank
-            try:
-                result = _lwd_probe_channel(group, peer, endpoints.dp_idx, channel, my_rank == sender)
-            except Exception as exc:
-                # The state is unknown (OOM, broken NPU context, a degraded
-                # backend): probing on it only manufactures untraceable
-                # paths, so treat it like a TIMEOUT and stop posting ops.
-                # BaseException keeps propagating.
-                failures.append(f"[dp_idx={endpoints.dp_idx} channel={channel.value}] probe raised: {exc!r}")
-                aborted = True
-                skipped = [f"dp{ep.dp_idx}/{ch.value}" for ep, ch in planned[index + 1 :]]
-                break
-            if result.outcome is _ProbeOutcome.OK:
-                logger.info(
-                    "[LWD] data-plane warmup done: dp_idx=%d channel=%s my_rank=%d peer=%d",
-                    endpoints.dp_idx,
-                    channel,
-                    my_rank,
-                    peer,
-                )
-                continue
-            failures.append(result.detail)
-            if result.outcome is _ProbeOutcome.TIMEOUT:
-                # The channel is wedged: the peer times out symmetrically,
-                # so stop posting ops entirely.
-                aborted = True
-                skipped = [f"dp{ep.dp_idx}/{ch.value}" for ep, ch in planned[index + 1 :]]
-                break
-    if skipped:
-        logger.warning(
-            "[LWD] channel probe aborted; %d channel(s) left unprobed: %s",
-            len(skipped),
-            ", ".join(skipped),
+    """Validate version, connection identity, and both directions of every local pair."""
+    timeout_s = envs.VLLM_ASCEND_LWD_HCCL_HANDSHAKE_TIMEOUT_S
+    if timeout_s <= 0:
+        raise ValueError("VLLM_ASCEND_LWD_HCCL_HANDSHAKE_TIMEOUT_S must be positive")
+    started = time.monotonic()
+    for endpoints in _LWD_ENDPOINTS:
+        connection = endpoints.connection_id
+        _lwd_echo_handshake(endpoints, connection, timeout_s)
+        logger.info(
+            "[LWD] data-plane echo validated connection=%s version=%d edge_rank=%d cloud_rank=%d",
+            connection,
+            _LWD_WIRE_VERSION,
+            endpoints.edge_rank,
+            endpoints.cloud_rank,
         )
-    # Verdict over the CPU/gloo group, never through the suspected HCCL
-    # channels; every rank (endpoints and non-endpoints) must reach this.
-    if not lwd_probe_aggregate(not failures, get_world_group().cpu_group):
-        detail = "; ".join(failures) or "remote rank(s) reported probe failure"
-        logger.error("[LWD] channel probe failed: %s", detail)
-        if not aborted:
-            # All ops completed and the groups are healthy: roll back for a
-            # clean restart.  (On TIMEOUT/raise the groups' state is unknown
-            # and they are deliberately left for process exit to reclaim.)
-            lwd_destroy_channels()
-        raise RuntimeError(f"[LWD] channel probe failed: {detail}")
-    get_world_group().barrier()
+    logger.info(
+        "[LWD] data-plane handshake complete rank=%d connections=%d duration=%.1fms",
+        dist.get_rank(),
+        len(_LWD_ENDPOINTS),
+        (time.monotonic() - started) * 1000,
+    )
 
 
 def lwd_channels_initialized() -> bool:
     return _LWD_CHANNELS_INITIALIZED
 
 
-def _lwd_channel(dp_idx: int, channel: LwdChannelType) -> tuple[dist.ProcessGroup, int]:
+def _lwd_channel(
+    dp_idx: int,
+    channel: LwdChannelType,
+    edge_id: int,
+    cloud_id: int,
+) -> tuple[dist.ProcessGroup, int]:
+    connection = ConnectionId(edge_id, cloud_id, dp_idx)
     try:
-        return _LWD_CHANNEL_GROUPS[(dp_idx, channel)]
+        return _LWD_CHANNEL_GROUPS[(connection, channel)]
     except KeyError:
         raise RuntimeError(
             f"[LWD] rank {dist.get_rank()} holds no {channel.value} channel of "
-            f"dp_idx {dp_idx}; only the endpoint ranks of that DP connection do"
+            f"connection {connection}; only its endpoint ranks do"
         ) from None
 
 
-def lwd_get_channel_device_group(channel: LwdChannelType, dp_idx: int = 0) -> dist.ProcessGroup:
-    group, _ = _lwd_channel(dp_idx, channel)
+def lwd_get_channel_device_group(
+    channel: LwdChannelType,
+    dp_idx: int = 0,
+    *,
+    edge_id: int = 0,
+    cloud_id: int = 0,
+) -> dist.ProcessGroup:
+    group, _ = _lwd_channel(dp_idx, channel, edge_id, cloud_id)
     return group
 
 
-def lwd_get_channel_peer(channel: LwdChannelType, dp_idx: int = 0) -> int:
-    """Global rank of this process's P2P peer on the DP connection's channel."""
-    _, peer = _lwd_channel(dp_idx, channel)
+def lwd_get_channel_peer(
+    channel: LwdChannelType,
+    dp_idx: int = 0,
+    *,
+    edge_id: int = 0,
+    cloud_id: int = 0,
+) -> int:
+    """Global rank of this process's P2P peer on the connection's channel."""
+    _, peer = _lwd_channel(dp_idx, channel, edge_id, cloud_id)
     return peer
 
 
-def lwd_get_channel_stream(channel: LwdChannelType, dp_idx: int = 0) -> torch.npu.Stream:
-    _lwd_channel(dp_idx, channel)
-    return _LWD_CHANNEL_STREAMS[(dp_idx, channel)]
+def lwd_get_channel_stream(
+    channel: LwdChannelType,
+    dp_idx: int = 0,
+    *,
+    edge_id: int = 0,
+    cloud_id: int = 0,
+) -> torch.npu.Stream:
+    _lwd_channel(dp_idx, channel, edge_id, cloud_id)
+    return _LWD_CHANNEL_STREAMS[(ConnectionId(edge_id, cloud_id, dp_idx), channel)]
 
 
 def lwd_destroy_channels() -> None:
     global _LWD_CHANNELS_INITIALIZED, _LWD_ENDPOINTS
-    for (dp_idx, channel), (group, _) in list(_LWD_CHANNEL_GROUPS.items()):
+    for (connection, channel), (group, _) in list(_LWD_CHANNEL_GROUPS.items()):
         try:
             dist.destroy_process_group(group)
         except Exception:
-            logger.warning("[LWD] failed to destroy the data-plane group for dp%d %s", dp_idx, channel.value)
+            logger.warning("[LWD] failed to destroy the data-plane group for %s %s", connection, channel.value)
     _LWD_CHANNEL_GROUPS.clear()
     _LWD_CHANNEL_STREAMS.clear()
     _LWD_ENDPOINTS = ()
