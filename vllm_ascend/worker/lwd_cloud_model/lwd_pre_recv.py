@@ -4,8 +4,9 @@
 The engine sends one hint per announced UP chunk over a dedicated message
 queue. The cloud endpoint plans per-request host staging from the hint's row
 tables, posts the receive, and reports each completed chunk as its channel
-watermark plus cumulative per-request arrival rows. A terminal comm failure is
-reported as ``("error", seqno, repr(exc))`` before the worker thread exits.
+watermark plus cumulative per-request arrival rows. A connection failure is
+reported as ``(connection, "error", seqno, repr(exc))``; its receive state is
+retired without stopping service to other connections.
 
 Both queues bypass ``rpc_broadcast_mq``, whose single consumer can block in
 model execution. The hint reader handle travels through the environment; the
@@ -14,7 +15,7 @@ JSON rather than pickle.
 
 Non-endpoint ranks own neither a cross-node receive nor host staging, so they
 do not participate in this protocol.
-"""
+"""  # 【MR2】模块说明更新：连接失败按 (connection, error, seqno, repr) 上报，只退休该连接的接收状态
 
 from __future__ import annotations
 
@@ -26,7 +27,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, NamedTuple
 
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId, LwdChannelType  # 【MR2】引入 ConnectionId 和通道类型：hint/水位都按连接区分
 
 if TYPE_CHECKING:
     from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
@@ -41,6 +42,7 @@ _SIDEBAND_MAX_CHUNKS = 64
 
 
 class LwdRecvHintFields(NamedTuple):
+    connection: ConnectionId  # 【MR2】hint 字段第一项就是连接编号
     seqno: int
     num_tokens: int
     aux_rows: int
@@ -57,6 +59,7 @@ def make_recv_hint(
     num_tokens: int,
     aux_rows: int = 0,
     *,
+    connection_id: ConnectionId,  # 【MR2】构造 hint 必须显式给连接编号（关键字参数，避免漏传）
     req_ids: list[str],
     rows: list[int],
     prompt_offsets: list[int],
@@ -66,6 +69,7 @@ def make_recv_hint(
 ) -> dict[str, Any]:
     """Build one UP hint with the complete per-request chunk geometry."""
     return {
+        "connection_id": connection_id,  # 【MR2】hint 载荷写入 connection_id
         "channel": LwdChannelType.UP,
         "seqno": int(seqno),
         "num_tokens": int(num_tokens),
@@ -89,7 +93,11 @@ def hint_fields(hint: dict[str, Any]) -> LwdRecvHintFields | None:
     if any(not isinstance(hint.get(name, []), list) for name in ("refills", "prefix_nonces")):
         return None
     try:
+        connection = hint.get("connection_id")  # 【MR2】解析 hint 时先取 connection_id
+        if not isinstance(connection, ConnectionId):
+            return None  # 【MR2】连接不是 ConnectionId 说明 hint 非法，直接返回 None
         fields = LwdRecvHintFields(
+            connection=connection,  # 【MR2】把连接放进结构化字段
             seqno=int(hint["seqno"]),
             num_tokens=int(hint["num_tokens"]),
             aux_rows=int(hint["aux_rows"]),
@@ -167,7 +175,13 @@ def _decode_handle(raw: str) -> Handle:
     return Handle(**fields)
 
 
-def create_hint_mq() -> MessageQueue:
+def _hint_env_key(connection: ConnectionId) -> str:  # 【MR2】每条连接一个 hint 队列的环境变量名
+    if connection == ConnectionId(0, 0, 0):  # 【MR2】默认连接沿用旧变量名，兼容 1E1C
+        return LWD_RECV_HINT_MQ_ENV
+    return f"{LWD_RECV_HINT_MQ_ENV}_E{connection.edge_id}C{connection.cloud_id}D{connection.dp_idx}"  # 【MR2】其它连接加 _E{edge}C{cloud}D{dp} 后缀，互不覆盖
+
+
+def create_hint_mq(connection_id: ConnectionId) -> MessageQueue:  # 【MR2】创建 hint MQ 时按连接导出 handle
     """Engine side: create the hint MQ (writer) and export the handle to
     the environment.
 
@@ -175,11 +189,11 @@ def create_hint_mq() -> MessageQueue:
     from the env at startup); both fork and spawn inherit via env vars.
     """
     mq = _new_sideband_mq()
-    os.environ[LWD_RECV_HINT_MQ_ENV] = _encode_handle(mq.export_handle())
+    os.environ[_hint_env_key(connection_id)] = _encode_handle(mq.export_handle())  # 【MR2】handle 写到该连接专属的环境变量
     return mq
 
 
-def attach_hint_mq() -> MessageQueue | None:
+def attach_hint_mq(connection_id: ConnectionId) -> MessageQueue | None:  # 【MR2】worker 侧按连接从环境变量重建 hint MQ
     """Worker side: rebuild the hint MQ reader from the handle in the
     environment.
 
@@ -187,7 +201,7 @@ def attach_hint_mq() -> MessageQueue | None:
     comm thread still runs reporting, so a missing hint only delays the
     early recv, never stalls the watermark.
     """
-    raw = os.environ.get(LWD_RECV_HINT_MQ_ENV)
+    raw = os.environ.get(_hint_env_key(connection_id))  # 【MR2】读取该连接专属的环境变量
     if raw is None:
         return None
     from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
@@ -204,72 +218,68 @@ def create_report_mq() -> MessageQueue:
 # ---------------------------------------------------------------------- #
 # Scheduler process side: hint dispatch + completion watermark           #
 # ---------------------------------------------------------------------- #
-_hint_sender: Callable[[dict[str, Any]], None] | None = None
-_watermarks: dict[LwdChannelType, int] = {}
+_hint_senders: dict[ConnectionId, Callable[[dict[str, Any]], None]] = {}  # 【MR2】hint 发送器按连接登记
+_watermarks: dict[tuple[ConnectionId, LwdChannelType], int] = {}  # 【MR2】水位按（连接, 通道）分开，seqno 相同也不冲突
 _lock = threading.Lock()
 
 
-def register_hint_sender(sender: Callable[[dict[str, Any]], None]) -> None:
-    """Install the transport used to dispatch hints (once per engine
-    process).
+def register_hint_sender(  # 【MR2】为某条连接登记发送器
+    sender: Callable[[dict[str, Any]], None],
+    connection_id: ConnectionId,
+) -> None:
+    """Install the reliable hint transport for one engine connection.
 
-    The closure passed in must **deliver reliably** (enqueue the hint
-    into the hint MQ): with the gate on, hints are a correctness
-    dependency — lose one and that recv is never pre-posted, the
-    watermark stalls, and the gated batch is never dispatched.
-    """
-    global _hint_sender
-    _hint_sender = sender
+    Losing a hint leaves its receive unposted and stalls the watermark.
+    """  # 【MR2】发送器按连接登记；丢 hint 会卡住该连接的预收和水位，所以必须可靠
+    _hint_senders[connection_id] = sender  # 【MR2】按连接保存发送器
 
 
 def post_irecv_hint(hint: dict[str, Any]) -> None:
-    """Send one recv hint to the local worker's comm thread.
+    """Send one validated recv hint to its connection's comm thread."""  # 【MR2】发送前先校验 hint 格式
+    fields = hint_fields(hint)  # 【MR2】解析出连接等字段
+    if fields is None:
+        raise ValueError(f"[LWD] malformed early-recv hint: {hint!r}")
+    sender = _hint_senders.get(fields.connection)  # 【MR2】按连接找发送器
+    if sender is None:
+        # The engine registers every sender during startup, before accepting  # 【MR2】找不到只报错，绝不借用其它连接的发送器
+        # edge messages. Never substitute another connection's sender: losing
+        # or misrouting the hint would stall the pre-recv gate forever.
+        raise RuntimeError(  # 【MR2】直接失败：错投 hint 会让另一条连接卡死
+            f"[LWD] early-recv hint for {fields.connection} seqno "
+            f"{fields.seqno} has no registered sender"
+        )
+    sender(hint)
 
-    The healthy path logs nothing (the caller ``lwd_cloud_engine`` logs
-    ``HINT ...``): this module keeps only should-never-happen diagnostics,
-    and they must be visible in the logs.
-    """
-    if _hint_sender is None:
-        # The engine registers the sender during startup, before it accepts
-        # any edge message, so a missing one is a wiring error; dropping the
-        # hint would stall the pre-recv gate forever (nobody would pre-post
-        # that recv, the watermark would never advance).
-        raise RuntimeError(f"[LWD] early-recv hint for seqno {hint.get('seqno')} has no registered sender")
-    _hint_sender(hint)
 
-
-def record_irecv_completions(
-    items: Iterable[tuple[LwdChannelType, int]],
-) -> list[tuple[LwdChannelType, int]]:
-    """Merge worker-reported completions into the per-channel watermark
-    (called after the engine drains the done MQ each step).
-
-    Returns the entries that **actually advanced** the watermark this
-    call, for the caller (``lwd_cloud_engine``) to log: whether the
-    watermark is moving is the first-hand evidence for locating which
-    segment is stuck, so the log lives in a module proven to emit.
-    """
-    advanced: list[tuple[LwdChannelType, int]] = []
+def record_irecv_completions(  # 【MR2】完成项统一合入
+    items: Iterable[tuple],  # 【MR2】每项是 (连接, 通道, seqno) 三元组
+) -> list[tuple]:
+    """Merge completions into independent per-connection watermarks."""  # 【MR2】合并成每条连接独立的完成水位
+    advanced: list[tuple] = []
     with _lock:
-        for channel, seqno in items:
-            if seqno > _watermarks.get(channel, -1):
-                _watermarks[channel] = seqno
-                advanced.append((channel, seqno))
+        for item in items:  # 【MR2】拆出连接、通道、seqno
+            connection, channel, seqno = item
+            key = (connection, channel)  # 【MR2】水位 key 包含连接
+            if seqno > _watermarks.get(key, -1):  # 【MR2】只推进更大的 seqno
+                _watermarks[key] = seqno
+                advanced.append(item)
     return advanced
 
 
-def watermark(channel: LwdChannelType) -> int:
-    """Current watermark: the max confirmed-complete seqno on the channel (-1 = none yet)."""
+def watermark(  # 【MR2】查询某条连接某通道的水位
+    channel: LwdChannelType,
+    connection_id: ConnectionId | None = None,
+) -> int:
+    """Current watermark on one connection (-1 = none yet)."""
+    connection = connection_id or ConnectionId(0, 0, 0)  # 【MR2】不传连接时按默认连接（兼容旧调用）
     with _lock:
-        return _watermarks.get(channel, -1)
+        return _watermarks.get((connection, channel), -1)  # 【MR2】返回水位，-1 表示还没有完成项
 
 
-def is_irecv_complete(channel: LwdChannelType, seqno: int) -> bool:
-    """Whether the seqno recv has completed on the channel — a pure
-    readiness predicate, no logging.
-
-    "Who is being waited on" comes from the gate's own log line
-    (``lwd_cloud_mixed_scheduler`` logs ``gate seqno=.. watermark=..
-    ready=..`` every step), so this stays a pure predicate.
-    """
-    return seqno <= watermark(channel)
+def is_irecv_complete(  # 【MR2】判断某条连接的某个 seqno 是否已完成
+    channel: LwdChannelType,
+    seqno: int,
+    connection_id: ConnectionId | None = None,
+) -> bool:
+    """Whether one connection's receive has completed."""
+    return seqno <= watermark(channel, connection_id)  # 【MR2】与水位比较即可

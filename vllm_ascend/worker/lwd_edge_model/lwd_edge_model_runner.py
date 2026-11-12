@@ -22,7 +22,12 @@ from vllm.v1.core.sched.output import LwdEmbedBatch, LwdUnembedBatch
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import LwdTransferFuture
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType, LwdTransferRequest
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import (  # 【MR2】引入连接相关类型：在飞发送和水位按连接区分
+    ConnectionId,  # 【MR2】ConnectionId：边的发送状态 key
+    LwdChannelType,  # 【MR2】LwdChannelType：发送/接收通道类型
+    LwdTransferRequest,  # 【MR2】LwdTransferRequest：数据面传输请求
+    connection_from,  # 【MR2】connection_from：从 batch 元数据取连接（兼容扁平字段）
+)
 from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import LwdBaseModelRunner
 from vllm_ascend.worker.lwd_edge_model.lwd_edge_mm_cache import LwdEdgeMmCache
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import pack_hash_payload
@@ -60,8 +65,8 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         super().__init__(vllm_config, device, worker)
         self.mm_cache = LwdEdgeMmCache()
         self.tid2eid_tables: list[torch.Tensor] = []
-        self._lwd_up_send_inflight: dict[int, deque[tuple[int, LwdTransferFuture]]] = {}
-        self._lwd_up_send_watermarks: dict[int, int] = {}
+        self._lwd_up_send_inflight: dict[ConnectionId, deque[tuple[int, LwdTransferFuture]]] = {}  # 【MR2】每条连接一个在飞发送队列
+        self._lwd_up_send_watermarks: dict[ConnectionId, int] = {}  # 【MR2】每条连接一个已发送水位
 
     def load_model(self) -> None:
         """Load the edge model and read the CPU Hash routing tables for
@@ -125,27 +130,29 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
 
     def _lwd_submit_up_send(self, request: LwdTransferRequest) -> None:
         future = self.worker.comm_service.submit_send(request)
-        pending = self._lwd_up_send_inflight.setdefault(request.dp_idx, deque())
+        pending = self._lwd_up_send_inflight.setdefault(request.connection, deque())  # 【MR2】按连接取/建在飞队列
         pending.append((request.seqno, future))
 
     def _lwd_pop_completed_up_sends(self) -> None:
-        """Advance each DP watermark only across its successful FIFO prefix."""
-        for dp_idx, pending in self._lwd_up_send_inflight.items():
+        """Advance each connection watermark across its successful FIFO prefix."""  # 【MR2】只推进每条连接队首已完成的发送，保证水位连续
+        for connection, pending in self._lwd_up_send_inflight.items():  # 【MR2】逐连接处理
             while pending and pending[0][1].done():
                 seqno, future = pending[0]
                 future.result()
                 pending.popleft()
-                self._lwd_up_send_watermarks[dp_idx] = seqno
+                self._lwd_up_send_watermarks[connection] = seqno  # 【MR2】记录该连接最新完成的 seqno
 
-    def _lwd_watermarked_output(self, dp_idx: int | None = None) -> ModelRunnerOutput:
+    def _lwd_watermarked_output(self, connection: ConnectionId | int | None = None) -> ModelRunnerOutput:  # 【MR2】构造带水位的输出，可指定单条连接
         self._lwd_pop_completed_up_sends()
-        if dp_idx is None:
+        if isinstance(connection, int):  # 【MR2】兼容旧 int 形式：补成 (0, 0, dp)
+            connection = ConnectionId(0, 0, connection)
+        if connection is None:  # 【MR2】不指定连接时输出所有连接的水位
             watermarks = {
-                known_dp_idx: self._lwd_up_send_watermarks.get(known_dp_idx, -1)
-                for known_dp_idx in self._lwd_up_send_inflight
+                known: self._lwd_up_send_watermarks.get(known, -1)  # 【MR2】遍历所有有在飞发送的连接
+                for known in self._lwd_up_send_inflight
             }
         else:
-            watermarks = {dp_idx: self._lwd_up_send_watermarks.get(dp_idx, -1)}
+            watermarks = {connection: self._lwd_up_send_watermarks.get(connection, -1)}  # 【MR2】只输出指定连接的水位
         return ModelRunnerOutput(
             req_ids=[],
             req_id_to_index={},
@@ -185,8 +192,9 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         scheduler_output: SchedulerOutput,
     ) -> ModelRunnerOutput:
         model = self.get_model()
+        connection = connection_from(batch_meta)  # 【MR2】从 batch 元数据取连接
         if not batch_meta.token_ids:
-            return self._lwd_watermarked_output(batch_meta.dp_idx)
+            return self._lwd_watermarked_output(connection)  # 【MR2】空批次也返回该连接的水位
 
         # Flatten all requests' prompt tokens into one batch (order = req_ids).
         flat_token_ids = [tid for token_ids in batch_meta.token_ids for tid in token_ids]
@@ -228,7 +236,9 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             channel=LwdChannelType.UP,
             op="send",
             num_elements=payload.numel(),
-            dp_idx=batch_meta.dp_idx,
+            dp_idx=connection.dp_idx,  # 【MR2】UP 发送请求带上完整连接坐标
+            edge_id=connection.edge_id,
+            cloud_id=connection.cloud_id,
             tensor=payload,
             seqno=seqno,
         )
@@ -246,11 +256,12 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             (time.monotonic() - _t0) * 1000,
             len(flat_token_ids),
         )
-        return self._lwd_watermarked_output(batch_meta.dp_idx)
+        return self._lwd_watermarked_output(connection)  # 【MR2】发送后返回该连接的最新水位
 
     @torch.inference_mode()
     def execute_lwd_unembed(self, seqno: int, batch_meta: LwdUnembedBatch) -> ModelRunnerOutput:
         model = self.get_model()
+        connection = connection_from(batch_meta)  # 【MR2】UNEMBED 同样从 batch 元数据取连接
         if not batch_meta.req_ids:
             return self._lwd_watermarked_output()
 
@@ -260,7 +271,9 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
                 channel=LwdChannelType.DOWN,
                 op="recv",
                 num_elements=batch_meta.recv_num_elements,  # int = rows_total * hidden_size
-                dp_idx=batch_meta.dp_idx,
+                dp_idx=connection.dp_idx,  # 【MR2】DOWN 接收带上完整连接坐标
+                edge_id=connection.edge_id,
+                cloud_id=connection.cloud_id,
                 seqno=seqno,
             )
         )
@@ -268,6 +281,11 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         # wait_on_current_stream: device-ordered wait; the host never blocks
         recv_future.wait_on_current_stream()
         result = recv_future.result()
+        # The receive tensor was allocated on the channel stream but is  # 【MR2】接收张量在通道流上分配，但由计算流上的 lm_head 消费
+        # consumed by lm_head on the compute stream. Keep its allocation
+        # alive until that stream's work completes, including after the
+        # future and its local result leave scope.
+        result.tensor.record_stream(torch.npu.current_stream())  # 【MR2】record_stream 保证计算流用完前不回收该张量
         _t_tensor = time.monotonic()
         hidden_size = self.model_config.get_hidden_size()
         hidden_states = result.tensor.view(-1, hidden_size)  # (rows_total, H)
