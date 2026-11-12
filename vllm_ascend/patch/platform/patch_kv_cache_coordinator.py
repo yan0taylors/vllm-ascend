@@ -6,6 +6,7 @@ from math import lcm
 
 import vllm
 import vllm.v1.core.kv_cache_coordinator as vllm_kv_cache_coordinator
+from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import (
@@ -88,6 +89,38 @@ def _manager_spec(spec: KVCacheSpec) -> KVCacheSpec:
     if isinstance(spec, UniformTypeKVCacheSpecs):
         return next(iter(spec.kv_cache_specs.values()))
     return spec
+
+
+def _safe_attr(obj: object, name: str) -> object:
+    """Best-effort attribute read for optional spec fields; never raises."""
+    try:
+        return getattr(obj, name)
+    except Exception:
+        return None
+
+
+def _compression_alignment(kv_cache_config: KVCacheConfig) -> int:
+    """LCM of per-state token counts of cacheable compressed MLA specs.
+
+    A prefix-cache hit must land on whole compressed states (e.g. 128 raw
+    tokens per C128 state), so this is the finest valid hit alignment for
+    models like DeepSeek-V4 whose MLA groups compress tokens.
+    """
+    align = 1
+    for group in kv_cache_config.kv_cache_groups:
+        if not is_prefix_cacheable(group.kv_cache_spec):
+            continue
+        spec = group.kv_cache_spec
+        inner_specs = (
+            list(spec.kv_cache_specs.values())
+            if isinstance(spec, UniformTypeKVCacheSpecs)
+            else [spec]
+        )
+        for inner in inner_specs:
+            tokens_per_state = _safe_attr(inner, "tokens_per_state")
+            if isinstance(tokens_per_state, int) and tokens_per_state > 1:
+                align = lcm(align, tokens_per_state)
+    return align
 
 
 class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
@@ -205,13 +238,51 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 for g in kv_cache_config.kv_cache_groups
                 if is_prefix_cacheable(g.kv_cache_spec)
             ), "block_size must be divisible by hash_block_size"
-        self.enable_partial_hash_hits = dcp_world_size == 1 and any(
-            isinstance(g.kv_cache_spec, MambaSpec)
-            and g.kv_cache_spec.mamba_cache_mode == "align"
-            and g.kv_cache_spec.block_size > hash_block_size
-            for g in kv_cache_config.kv_cache_groups
+        self.enable_partial_hash_hits = allow_partial_hash_hits and (
+            dcp_world_size == 1
+            and (
+                # Fine-grained hits for compressed MLA groups (DeepSeek-V4):
+                # cache hits may land on whole compressed states (128 tokens
+                # per C128 state) instead of the scheduler LCM block.
+                _compression_alignment(kv_cache_config) > 1
+                or any(
+                    isinstance(g.kv_cache_spec, MambaSpec)
+                    and g.kv_cache_spec.mamba_cache_mode == "align"
+                    and g.kv_cache_spec.block_size > hash_block_size
+                    for g in kv_cache_config.kv_cache_groups
+                )
+            )
         )
         self.verify_and_split_kv_cache_groups()
+
+        # The base coordinator turns partial hits off when a cacheable manager
+        # cannot look up at hash granularity. Groups whose block divides the
+        # hit alignment match whole blocks at every probe boundary and round
+        # their hit down to the alignment (e.g. DSV4 SWA/state groups:
+        # 128 % 128/8/32 == 0), so they never need interior probes; only a
+        # group that needs finer probes without fine-grained support must
+        # downgrade.
+        if self.enable_partial_hash_hits:
+            hit_alignment = self._cache_hit_alignment_tokens
+            unsupported_partial_hit_managers = {
+                type(manager).__name__
+                for manager, group in zip(
+                    self.single_type_managers,
+                    self.kv_cache_config.kv_cache_groups,
+                )
+                if is_prefix_cacheable(group.kv_cache_spec)
+                and not manager.supports_fine_grained_hash_lookup
+                and manager.block_size != self.hash_block_size
+                and hit_alignment % manager.block_size != 0
+            }
+            if unsupported_partial_hit_managers:
+                self.enable_partial_hash_hits = False
+                logger.warning_once(
+                    "Disabling fine-grained prefix-cache hits because these KV "
+                    "cache managers cannot serve %d-token-aligned probes: %s.",
+                    hit_alignment,
+                    ", ".join(sorted(unsupported_partial_hit_managers)),
+                )
 
         # Align the WRITE-path mask granularity (reachable_block_mask) with the
         # READ-path hit granularity (find_longest_cache_hit) so SlidingWindowManager
@@ -246,7 +317,13 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
     def _cache_hit_alignment_tokens(self) -> int:
         tail_alignment = getattr(self, "tail_pool_alignment", 1)
         if self.enable_partial_hash_hits:
-            return lcm(self.hash_block_size, tail_alignment)
+            # Hits must land on whole compressed states (e.g. 128 tokens per
+            # C128 state), not just on hash-block boundaries.
+            return lcm(
+                self.hash_block_size,
+                tail_alignment,
+                _compression_alignment(self.kv_cache_config),
+            )
         return lcm(self.scheduler_block_size or self.lcm_block_size, tail_alignment)
 
     def _get_effective_block_size(self, kv_cache_spec: KVCacheSpec) -> int:
@@ -405,7 +482,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 if drop_eagle_block and not isinstance(spec, MambaSpec):
                     # Eagle needs to match one more block and then pop the last.
                     eagle_margin = (
-                        self.hash_block_size
+                        self._cache_hit_alignment_tokens
                         if self.enable_partial_hash_hits
                         and manager_cls.supports_fine_grained_hash_lookup
                         and group_block_size > self.hash_block_size

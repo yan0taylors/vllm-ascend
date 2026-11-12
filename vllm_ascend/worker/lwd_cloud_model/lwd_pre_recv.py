@@ -4,8 +4,9 @@
 The engine sends one hint per announced UP chunk over a dedicated message
 queue. The cloud endpoint plans per-request host staging from the hint's row
 tables, posts the receive, and reports each completed chunk as its channel
-watermark plus cumulative per-request arrival rows. A terminal comm failure is
-reported as ``("error", seqno, repr(exc))`` before the worker thread exits.
+watermark plus cumulative per-request arrival rows. A connection failure is
+reported as ``(connection, "error", seqno, repr(exc))``; its receive state is
+retired without stopping service to other connections.
 
 Both queues bypass ``rpc_broadcast_mq``, whose single consumer can block in
 model execution. The hint reader handle travels through the environment; the
@@ -26,7 +27,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, NamedTuple
 
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId, LwdChannelType
 
 if TYPE_CHECKING:
     from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
@@ -41,6 +42,7 @@ _SIDEBAND_MAX_CHUNKS = 64
 
 
 class LwdRecvHintFields(NamedTuple):
+    connection: ConnectionId
     seqno: int
     num_tokens: int
     aux_rows: int
@@ -57,6 +59,7 @@ def make_recv_hint(
     num_tokens: int,
     aux_rows: int = 0,
     *,
+    connection_id: ConnectionId,
     req_ids: list[str],
     rows: list[int],
     prompt_offsets: list[int],
@@ -66,6 +69,7 @@ def make_recv_hint(
 ) -> dict[str, Any]:
     """Build one UP hint with the complete per-request chunk geometry."""
     return {
+        "connection_id": connection_id,
         "channel": LwdChannelType.UP,
         "seqno": int(seqno),
         "num_tokens": int(num_tokens),
@@ -89,7 +93,11 @@ def hint_fields(hint: dict[str, Any]) -> LwdRecvHintFields | None:
     if any(not isinstance(hint.get(name, []), list) for name in ("refills", "prefix_nonces")):
         return None
     try:
+        connection = hint.get("connection_id")
+        if not isinstance(connection, ConnectionId):
+            return None
         fields = LwdRecvHintFields(
+            connection=connection,
             seqno=int(hint["seqno"]),
             num_tokens=int(hint["num_tokens"]),
             aux_rows=int(hint["aux_rows"]),
@@ -167,7 +175,13 @@ def _decode_handle(raw: str) -> Handle:
     return Handle(**fields)
 
 
-def create_hint_mq() -> MessageQueue:
+def _hint_env_key(connection: ConnectionId) -> str:
+    if connection == ConnectionId(0, 0, 0):
+        return LWD_RECV_HINT_MQ_ENV
+    return f"{LWD_RECV_HINT_MQ_ENV}_E{connection.edge_id}C{connection.cloud_id}D{connection.dp_idx}"
+
+
+def create_hint_mq(connection_id: ConnectionId) -> MessageQueue:
     """Engine side: create the hint MQ (writer) and export the handle to
     the environment.
 
@@ -175,11 +189,11 @@ def create_hint_mq() -> MessageQueue:
     from the env at startup); both fork and spawn inherit via env vars.
     """
     mq = _new_sideband_mq()
-    os.environ[LWD_RECV_HINT_MQ_ENV] = _encode_handle(mq.export_handle())
+    os.environ[_hint_env_key(connection_id)] = _encode_handle(mq.export_handle())
     return mq
 
 
-def attach_hint_mq() -> MessageQueue | None:
+def attach_hint_mq(connection_id: ConnectionId) -> MessageQueue | None:
     """Worker side: rebuild the hint MQ reader from the handle in the
     environment.
 
@@ -187,7 +201,7 @@ def attach_hint_mq() -> MessageQueue | None:
     comm thread still runs reporting, so a missing hint only delays the
     early recv, never stalls the watermark.
     """
-    raw = os.environ.get(LWD_RECV_HINT_MQ_ENV)
+    raw = os.environ.get(_hint_env_key(connection_id))
     if raw is None:
         return None
     from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
@@ -204,72 +218,68 @@ def create_report_mq() -> MessageQueue:
 # ---------------------------------------------------------------------- #
 # Scheduler process side: hint dispatch + completion watermark           #
 # ---------------------------------------------------------------------- #
-_hint_sender: Callable[[dict[str, Any]], None] | None = None
-_watermarks: dict[LwdChannelType, int] = {}
+_hint_senders: dict[ConnectionId, Callable[[dict[str, Any]], None]] = {}
+_watermarks: dict[tuple[ConnectionId, LwdChannelType], int] = {}
 _lock = threading.Lock()
 
 
-def register_hint_sender(sender: Callable[[dict[str, Any]], None]) -> None:
-    """Install the transport used to dispatch hints (once per engine
-    process).
+def register_hint_sender(
+    sender: Callable[[dict[str, Any]], None],
+    connection_id: ConnectionId,
+) -> None:
+    """Install the reliable hint transport for one engine connection.
 
-    The closure passed in must **deliver reliably** (enqueue the hint
-    into the hint MQ): with the gate on, hints are a correctness
-    dependency — lose one and that recv is never pre-posted, the
-    watermark stalls, and the gated batch is never dispatched.
+    Losing a hint leaves its receive unposted and stalls the watermark.
     """
-    global _hint_sender
-    _hint_sender = sender
+    _hint_senders[connection_id] = sender
 
 
 def post_irecv_hint(hint: dict[str, Any]) -> None:
-    """Send one recv hint to the local worker's comm thread.
-
-    The healthy path logs nothing (the caller ``lwd_cloud_engine`` logs
-    ``HINT ...``): this module keeps only should-never-happen diagnostics,
-    and they must be visible in the logs.
-    """
-    if _hint_sender is None:
-        # The engine registers the sender during startup, before it accepts
-        # any edge message, so a missing one is a wiring error; dropping the
-        # hint would stall the pre-recv gate forever (nobody would pre-post
-        # that recv, the watermark would never advance).
-        raise RuntimeError(f"[LWD] early-recv hint for seqno {hint.get('seqno')} has no registered sender")
-    _hint_sender(hint)
+    """Send one validated recv hint to its connection's comm thread."""
+    fields = hint_fields(hint)
+    if fields is None:
+        raise ValueError(f"[LWD] malformed early-recv hint: {hint!r}")
+    sender = _hint_senders.get(fields.connection)
+    if sender is None:
+        # The engine registers every sender during startup, before accepting
+        # edge messages. Never substitute another connection's sender: losing
+        # or misrouting the hint would stall the pre-recv gate forever.
+        raise RuntimeError(
+            f"[LWD] early-recv hint for {fields.connection} seqno "
+            f"{fields.seqno} has no registered sender"
+        )
+    sender(hint)
 
 
 def record_irecv_completions(
-    items: Iterable[tuple[LwdChannelType, int]],
-) -> list[tuple[LwdChannelType, int]]:
-    """Merge worker-reported completions into the per-channel watermark
-    (called after the engine drains the done MQ each step).
-
-    Returns the entries that **actually advanced** the watermark this
-    call, for the caller (``lwd_cloud_engine``) to log: whether the
-    watermark is moving is the first-hand evidence for locating which
-    segment is stuck, so the log lives in a module proven to emit.
-    """
-    advanced: list[tuple[LwdChannelType, int]] = []
+    items: Iterable[tuple],
+) -> list[tuple]:
+    """Merge completions into independent per-connection watermarks."""
+    advanced: list[tuple] = []
     with _lock:
-        for channel, seqno in items:
-            if seqno > _watermarks.get(channel, -1):
-                _watermarks[channel] = seqno
-                advanced.append((channel, seqno))
+        for item in items:
+            connection, channel, seqno = item
+            key = (connection, channel)
+            if seqno > _watermarks.get(key, -1):
+                _watermarks[key] = seqno
+                advanced.append(item)
     return advanced
 
 
-def watermark(channel: LwdChannelType) -> int:
-    """Current watermark: the max confirmed-complete seqno on the channel (-1 = none yet)."""
+def watermark(
+    channel: LwdChannelType,
+    connection_id: ConnectionId | None = None,
+) -> int:
+    """Current watermark on one connection (-1 = none yet)."""
+    connection = connection_id or ConnectionId(0, 0, 0)
     with _lock:
-        return _watermarks.get(channel, -1)
+        return _watermarks.get((connection, channel), -1)
 
 
-def is_irecv_complete(channel: LwdChannelType, seqno: int) -> bool:
-    """Whether the seqno recv has completed on the channel — a pure
-    readiness predicate, no logging.
-
-    "Who is being waited on" comes from the gate's own log line
-    (``lwd_cloud_mixed_scheduler`` logs ``gate seqno=.. watermark=..
-    ready=..`` every step), so this stays a pure predicate.
-    """
-    return seqno <= watermark(channel)
+def is_irecv_complete(
+    channel: LwdChannelType,
+    seqno: int,
+    connection_id: ConnectionId | None = None,
+) -> bool:
+    """Whether one connection's receive has completed."""
+    return seqno <= watermark(channel, connection_id)

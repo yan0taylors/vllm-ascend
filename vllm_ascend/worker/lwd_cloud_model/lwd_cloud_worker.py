@@ -27,7 +27,11 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 import vllm_ascend.ops  # noqa: F401
 from vllm_ascend.distributed.lwd_data_plane.lwd_data_plane import lwd_get_data_plane
 from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import LwdTransferFuture
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType, LwdTransferRequest
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import (
+    ConnectionId,
+    LwdChannelType,
+    LwdTransferRequest,
+)
 from vllm_ascend.worker.lwd_base_model.lwd_worker_base import LwdWorkerBase
 from vllm_ascend.worker.lwd_cloud_model.lwd_cloud_model_runner import (
     LwdCloudModelRunner,
@@ -54,6 +58,7 @@ _LWD_EARLY_RECV_ERROR_SLEEP_S = 0.01
 _LWD_EARLY_RECV_LOOP_SLEEP_S = 0.002
 _LWD_EARLY_RECV_MAX_INFLIGHT = 2
 _LWD_HOST_STAGE_SLOTS = 2
+_LWD_SHUTDOWN_TIMEOUT_S = 5.0
 
 
 class LwdCloudWorker(LwdWorkerBase):
@@ -64,7 +69,7 @@ class LwdCloudWorker(LwdWorkerBase):
 
     def init_device(self) -> None:
         super().init_device()
-        self._lwd_down_next_seqno = 0
+        self._lwd_down_next_seqno: dict[ConnectionId, int] = {}
         self._init_lwd_early_recv_state()
         if self.use_v2_model_runner:
             raise RuntimeError("LWD data plane requires the V1 model runner; use_v2_model_runner is not supported")
@@ -76,9 +81,29 @@ class LwdCloudWorker(LwdWorkerBase):
         lwd_config = self.vllm_config.lwd_config
         assert lwd_config is not None
         self._lwd_dp_idx = self.vllm_config.parallel_config.data_parallel_index
-        endpoint_rank = lwd_config.instance.dp[self._lwd_dp_idx].ranks[0]
+        self._lwd_connections = tuple(
+            connection.connection_id
+            for connection in lwd_config.connections
+            if connection.connection_id.dp_idx == self._lwd_dp_idx
+        )
+        if not self._lwd_connections:
+            self._lwd_connections = (ConnectionId(0, lwd_config.instance.id, self._lwd_dp_idx),)
+        from vllm.distributed.lwd import LwdParallelGroupsSpec
+
         global_rank = dist.get_rank()
-        self._lwd_early_recv_endpoint = global_rank == endpoint_rank
+        spec = LwdParallelGroupsSpec.from_topology(lwd_config.topology)
+        local = set(self._lwd_connections)
+        self._lwd_up_src_ranks = {
+            endpoints.connection_id: endpoints.cloud_rank
+            for endpoints in spec.channel_endpoints
+            if endpoints.connection_id in local
+        }
+        if set(self._lwd_up_src_ranks) != local:
+            raise RuntimeError("[Lwd][cloud-worker] missing channel endpoint for a local connection")
+        self._lwd_early_recv_connections = tuple(
+            connection for connection in self._lwd_connections if self._lwd_up_src_ranks[connection] == global_rank
+        )
+        self._lwd_early_recv_endpoint = bool(self._lwd_early_recv_connections)
         self._lwd_up_hidden_size = self.model_config.get_hidden_size()
         self._lwd_up_num_hash_layers = hash_layer_count(self.model_config.hf_config)
         self._lwd_up_num_experts_per_tok = getattr(self.model_config.hf_config, "num_experts_per_tok", 0)
@@ -179,6 +204,10 @@ class LwdCloudWorker(LwdWorkerBase):
         meta = batch.batch_meta
         if meta is None or self._lwd_stager is None:
             return
+        from vllm_ascend.distributed.lwd_data_plane.lwd_types import connection_from
+
+        if connection_from(meta) not in self._lwd_early_recv_connections:
+            return
         for req_id in meta.aborted_req_ids or ():
             self._lwd_stager.abort_request(req_id)
 
@@ -189,15 +218,19 @@ class LwdCloudWorker(LwdWorkerBase):
     def _init_lwd_early_recv_state(self) -> None:
         """Initialize queued, submitted, and delivered UP receive state."""
         self._early_recv_max_inflight = _LWD_EARLY_RECV_MAX_INFLIGHT
-        self._early_recv_futures: dict[tuple[LwdChannelType, int], LwdTransferFuture] = {}
-        self._early_recv_pending: dict[tuple[LwdChannelType, int], dict[str, Any]] = {}
-        self._early_recv_last_delivered = -1
-        self._early_recv_current_seqno = -1
+        self._early_recv_futures: dict[tuple[ConnectionId, LwdChannelType, int], LwdTransferFuture] = {}
+        self._early_recv_pending: dict[tuple[ConnectionId, LwdChannelType, int], dict[str, Any]] = {}
+        self._early_recv_reserved: set[tuple[ConnectionId, LwdChannelType, int]] = set()
+        self._early_recv_last_delivered: dict[ConnectionId, int] = {}
+        self._early_recv_failed_connections: set[ConnectionId] = set()
+        self._early_recv_current_key: tuple[ConnectionId, LwdChannelType, int] | None = None
+        self._early_recv_rr = 0
         self._early_recv_lock = threading.Lock()
         self._lwd_stager: LwdHostStager | None = None
-        self._irecv_hint_mq = None
-        self._irecv_done_mq = None
+        self._irecv_hint_mqs: dict[ConnectionId, Any] = {}
+        self._irecv_done_mqs: dict[ConnectionId, Any] = {}
         self._lwd_early_recv_thread: threading.Thread | None = None
+        self._lwd_early_recv_stop = threading.Event()
 
     def _lwd_build_up_recv_request(
         self,
@@ -209,7 +242,9 @@ class LwdCloudWorker(LwdWorkerBase):
         return LwdTransferRequest(
             channel=LwdChannelType.UP,
             op="recv",
-            dp_idx=self._lwd_dp_idx,
+            dp_idx=fields.connection.dp_idx,
+            edge_id=fields.connection.edge_id,
+            cloud_id=fields.connection.cloud_id,
             num_elements=hash_payload_numel(
                 fields.num_tokens,
                 self._lwd_up_hidden_size,
@@ -238,15 +273,19 @@ class LwdCloudWorker(LwdWorkerBase):
             create_report_mq,
         )
 
-        self._irecv_hint_mq = attach_hint_mq()
-        self._irecv_done_mq = create_report_mq()
+        connections = getattr(self, "_lwd_early_recv_connections", ())
+        for connection in connections:
+            self._irecv_hint_mqs[connection] = attach_hint_mq(connection)
+            self._irecv_done_mqs[connection] = create_report_mq()
         # The engine fetches this MQ's handle through
         # lwd_early_recv_done_handle over collective_rpc once the executor
         # is up, so the vllm executor stays free of LWD plumbing.
         lwd_logger.info(
             "[Lwd][pre-recv] comm thread starting rank=%d hint MQ=%s",
             self.rank,
-            "attached" if self._irecv_hint_mq is not None else "none",
+            "attached"
+            if any(mq is not None for mq in self._irecv_hint_mqs.values())
+            else "none",
         )
         self._lwd_early_recv_thread = threading.Thread(
             target=self._lwd_early_recv_loop,
@@ -255,13 +294,14 @@ class LwdCloudWorker(LwdWorkerBase):
         )
         self._lwd_early_recv_thread.start()
 
-    def lwd_early_recv_done_handle(self) -> Handle | None:
-        """Handle of the early-recv done MQ, for the engine to attach its
-        reader; None on ranks that do not report completions (the
-        non-endpoint ranks hold no cross-node channel)."""
-        if self._irecv_done_mq is None:
+    def lwd_early_recv_done_handle(
+        self, connection_id: ConnectionId
+    ) -> Handle | None:
+        """Handle of one connection's done MQ, for the engine reader."""
+        done_mq = self._irecv_done_mqs.get(connection_id)
+        if done_mq is None:
             return None
-        return self._irecv_done_mq.export_handle()
+        return done_mq.export_handle()
 
     def _lwd_early_recv_loop(self) -> None:
         """Comm thread body: take hints -> pre-post recvs; poll futures ->
@@ -281,24 +321,36 @@ class LwdCloudWorker(LwdWorkerBase):
             "[Lwd][pre-recv] comm thread up rank=%d device=%s hint MQ=%s",
             self.rank,
             self.device,
-            "attached" if self._irecv_hint_mq is not None else "none",
+            "attached"
+            if any(mq is not None for mq in self._irecv_hint_mqs.values())
+            else "none",
         )
-        hint_mq = self._irecv_hint_mq
-        while True:
+        hint_mqs = {
+            connection: mq
+            for connection, mq in self._irecv_hint_mqs.items()
+            if mq is not None
+        }
+        while not self._lwd_early_recv_stop.is_set():
+            for connection, hint_mq in hint_mqs.items():
+                if connection in self._early_recv_failed_connections:
+                    continue
+                try:
+                    hint = hint_mq.dequeue(timeout=_LWD_EARLY_RECV_DEQUEUE_TIMEOUT_S)
+                    self.start_early_irecv(hint, connection_id=connection)
+                except TimeoutError:
+                    continue
+                except Exception as exc:
+                    self._lwd_fail_early_recv_connection(connection, self._early_recv_error_seqno(connection), exc)
+                    time.sleep(_LWD_EARLY_RECV_ERROR_SLEEP_S)
             try:
-                if hint_mq is not None:
-                    try:
-                        hint = hint_mq.dequeue(timeout=_LWD_EARLY_RECV_DEQUEUE_TIMEOUT_S)
-                    except TimeoutError:
-                        pass
-                    except Exception:
-                        lwd_logger.exception("[Lwd][pre-recv] hint MQ dequeue failed")
-                        time.sleep(_LWD_EARLY_RECV_ERROR_SLEEP_S)
-                    else:
-                        self.start_early_irecv(hint)
                 self._report_irecv_completions()
             except Exception as exc:
-                self._lwd_notify_early_recv_error(exc)
+                key = self._early_recv_current_key
+                if key is None:
+                    raise
+                connection = key[0]
+                self._lwd_fail_early_recv_connection(connection, self._early_recv_error_seqno(connection), exc)
+            if hint_mqs and all(connection in self._early_recv_failed_connections for connection in hint_mqs):
                 return
             # The ring's read side sched_yield-spins within the
             # just-read window (busy_loop_s=1s), so a 0.5ms timeout alone
@@ -306,31 +358,94 @@ class LwdCloudWorker(LwdWorkerBase):
             # added visibility latency on hints and watermarks each.
             time.sleep(_LWD_EARLY_RECV_LOOP_SLEEP_S)
 
-    def _lwd_notify_early_recv_error(self, exc: Exception) -> None:
-        """Report a terminal comm failure once; the loop returns afterwards."""
-        seqno = self._early_recv_current_seqno
-        lwd_logger.exception("[Lwd][pre-recv] comm thread failed seqno=%d", seqno)
-        done_mq = self._irecv_done_mq
-        if done_mq is None:
-            return
-        try:
-            done_mq.enqueue(("error", seqno, repr(exc)))
-        except Exception:
-            lwd_logger.exception("[Lwd][pre-recv] failed to report comm error seqno=%d", seqno)
+    def _early_recv_error_seqno(self, connection: ConnectionId) -> int:
+        key = self._early_recv_current_key
+        if key is not None and key[0] == connection:
+            return key[2]
+        candidates = [
+            key[2]
+            for key in (*self._early_recv_futures, *self._early_recv_reserved, *self._early_recv_pending)
+            if key[0] == connection
+        ]
+        return min(candidates) if candidates else -1
 
-    def start_early_irecv(self, hint: dict[str, Any]) -> None:
+    def _lwd_fail_early_recv_connection(self, connection: ConnectionId, seqno: int, exc: Exception) -> None:
+        """Clean one failed peer and report it through the engine error ABI."""
+        with self._early_recv_lock:
+            if connection in self._early_recv_failed_connections:
+                return
+            self._early_recv_failed_connections.add(connection)
+            for key in list(self._early_recv_reserved):
+                if key[0] == connection:
+                    self._early_recv_reserved.discard(key)
+            for key in list(self._early_recv_pending):
+                if key[0] == connection:
+                    self._early_recv_pending.pop(key, None)
+            futures = [future for key, future in self._early_recv_futures.items() if key[0] == connection]
+            for key in list(self._early_recv_futures):
+                if key[0] == connection:
+                    self._early_recv_futures.pop(key, None)
+            self._early_recv_last_delivered.pop(connection, None)
+            if self._early_recv_current_key is not None and self._early_recv_current_key[0] == connection:
+                self._early_recv_current_key = None
+        for future in futures:
+            try:
+                future.release_device_tensor()
+            except Exception:
+                lwd_logger.exception("[Lwd][pre-recv] failed to release receive tensor connection=%s", connection)
+        if self._lwd_stager is not None:
+            try:
+                self._lwd_stager.abandon_connection(connection)
+            except Exception:
+                lwd_logger.exception("[Lwd][pre-recv] failed to clean host staging connection=%s", connection)
+        try:
+            lwd_get_data_plane().abort_connection(connection, exc)
+        except Exception:
+            lwd_logger.exception("[Lwd][pre-recv] failed to clean data plane connection=%s", connection)
+        lwd_logger.exception("[Lwd][pre-recv] connection failed connection=%s seqno=%d", connection, seqno)
+        done_mq = self._irecv_done_mqs.get(connection)
+        if done_mq is not None:
+            try:
+                done_mq.enqueue((connection, "error", seqno, repr(exc)))
+            except Exception:
+                lwd_logger.exception(
+                    "[Lwd][pre-recv] failed to report comm error connection=%s seqno=%d",
+                    connection,
+                    seqno,
+                )
+
+    def start_early_irecv(
+        self,
+        hint: dict[str, Any],
+        connection_id: ConnectionId,
+    ) -> None:
         """Queue one validated UP hint and submit it when capacity allows."""
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import hint_fields
 
         fields = hint_fields(hint)
-        if fields is None or hint.get("channel") is not LwdChannelType.UP:
-            lwd_logger.warning("[Lwd][pre-recv] malformed hint %s, skipped", hint)
+        if (
+            fields is None
+            or fields.connection != connection_id
+            or hint.get("channel") is not LwdChannelType.UP
+        ):
+            try:
+                seqno = int(hint.get("seqno", -1)) if isinstance(hint, dict) else -1
+            except (TypeError, ValueError):
+                seqno = -1
+            self._lwd_fail_early_recv_connection(
+                connection_id,
+                seqno,
+                ValueError(f"malformed UP receive hint: {hint!r}"),
+            )
             return
-        key = (LwdChannelType.UP, fields.seqno)
+        key = (fields.connection, LwdChannelType.UP, fields.seqno)
         with self._early_recv_lock:
+            if fields.connection in self._early_recv_failed_connections:
+                return
             if (
-                fields.seqno <= self._early_recv_last_delivered
+                fields.seqno <= self._early_recv_last_delivered.get(fields.connection, -1)
                 or key in self._early_recv_futures
+                or key in self._early_recv_reserved
                 or key in self._early_recv_pending
             ):
                 return
@@ -347,9 +462,10 @@ class LwdCloudWorker(LwdWorkerBase):
             self._lwd_up_num_hash_layers,
             self._lwd_up_num_experts_per_tok,
         )
-        recv_buffer, _slot = stager.allocate(fields.seqno, numel)
+        stage_key = (fields.connection, fields.seqno)
+        recv_buffer, _slot = stager.allocate(stage_key, numel)
         segments = stager.plan_recv_segments(
-            seqno=fields.seqno,
+            seqno=stage_key,
             numel=numel,
             hidden_size=self._lwd_up_hidden_size,
             req_ids=fields.req_ids,
@@ -364,36 +480,100 @@ class LwdCloudWorker(LwdWorkerBase):
         request = self._lwd_build_up_recv_request(fields, recv_buffer, segments)
         return lwd_get_data_plane().submit_recv(request)
 
+    def _early_recv_quota(self, connections: list[ConnectionId]) -> int:
+        """Soft per-connection share; unused capacity remains work conserving."""
+        if not connections:
+            return self._early_recv_max_inflight
+        return max(1, (self._early_recv_max_inflight + len(connections) - 1) // len(connections))
+
+    def _pick_pending_locked(
+        self, blocked: set[ConnectionId]
+    ) -> tuple[tuple[ConnectionId, LwdChannelType, int], dict[str, Any]] | None:
+        """Pick one connection head fairly, preferring its soft quota."""
+        by_connection: dict[ConnectionId, list[tuple[ConnectionId, LwdChannelType, int]]] = {}
+        for key in self._early_recv_pending:
+            by_connection.setdefault(key[0], []).append(key)
+        connections = sorted(connection for connection in by_connection if connection not in blocked)
+        if not connections:
+            return None
+        quota = self._early_recv_quota(connections)
+        start = self._early_recv_rr % len(connections)
+        ordered = connections[start:] + connections[:start]
+        counts: dict[ConnectionId, int] = {connection: 0 for connection in connections}
+        for connection, _channel, _seqno in (*self._early_recv_futures, *self._early_recv_reserved):
+            counts[connection] = counts.get(connection, 0) + 1
+        selected = next((connection for connection in ordered if counts.get(connection, 0) < quota), None)
+        if selected is None:
+            selected = ordered[0]
+        key = min(by_connection[selected], key=lambda item: item[2])
+        self._early_recv_rr = (connections.index(selected) + 1) % len(connections)
+        return key, self._early_recv_pending[key]
+
     def _early_recv_pump(self) -> None:
-        """Submit queued hints in order, leaving a busy hint at the head."""
+        """Reserve under lock, then submit independent FIFOs without cross-connection HOL blocking."""
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import hint_fields
 
+        blocked: set[ConnectionId] = set()
         while True:
             with self._early_recv_lock:
-                if not self._early_recv_pending or len(self._early_recv_futures) >= self._early_recv_max_inflight:
+                if len(self._early_recv_futures) + len(self._early_recv_reserved) >= self._early_recv_max_inflight:
                     return
-                key, hint = next(iter(self._early_recv_pending.items()))
+                picked = self._pick_pending_locked(blocked)
+                if picked is None:
+                    return
+                key, hint = picked
                 fields = hint_fields(hint)
                 assert fields is not None
-                self._early_recv_current_seqno = fields.seqno
-                try:
-                    future = self._lwd_submit_early_recv(fields)
-                except LwdHostStageSlotBusy:
-                    self._early_recv_current_seqno = -1
-                    return
-                except Exception:
-                    self._early_recv_pending.pop(key, None)
-                    assert self._lwd_stager is not None
-                    self._lwd_stager.abandon(fields.seqno)
-                    raise
                 self._early_recv_pending.pop(key)
-                self._early_recv_futures[key] = future
-                self._early_recv_current_seqno = -1
-                inflight = len(self._early_recv_futures)
-                queued = len(self._early_recv_pending)
+                self._early_recv_reserved.add(key)
+                self._early_recv_current_key = key
+            try:
+                future = self._lwd_submit_early_recv(fields)
+            except LwdHostStageSlotBusy:
+                with self._early_recv_lock:
+                    self._early_recv_reserved.discard(key)
+                    if fields.connection not in self._early_recv_failed_connections:
+                        self._early_recv_pending[key] = hint
+                    if self._early_recv_current_key == key:
+                        self._early_recv_current_key = None
+                blocked.add(fields.connection)
+                continue
+            except Exception as exc:
+                with self._early_recv_lock:
+                    self._early_recv_reserved.discard(key)
+                    if self._early_recv_current_key == key:
+                        self._early_recv_current_key = None
+                if self._lwd_stager is not None:
+                    self._lwd_stager.abandon((fields.connection, fields.seqno))
+                self._lwd_fail_early_recv_connection(fields.connection, fields.seqno, exc)
+                blocked.add(fields.connection)
+                continue
+
+            release_future = False
+            with self._early_recv_lock:
+                self._early_recv_reserved.discard(key)
+                if fields.connection in self._early_recv_failed_connections:
+                    release_future = True
+                else:
+                    self._early_recv_futures[key] = future
+                    inflight = len(self._early_recv_futures)
+                    queued = len(self._early_recv_pending)
+                if self._early_recv_current_key == key:
+                    self._early_recv_current_key = None
+            if release_future:
+                try:
+                    future.release_device_tensor()
+                except Exception:
+                    lwd_logger.exception(
+                        "[Lwd][pre-recv] failed to release receive tensor connection=%s", fields.connection
+                    )
+                blocked.add(fields.connection)
+                continue
             lwd_logger.info(
-                "[Lwd][pre-recv] SUBMIT channel=%s seqno=%d num_tokens=%d aux_rows=%d inflight=%d queued=%d",
-                key[0].value,
+                "[Lwd][pre-recv] SUBMIT connection=%s channel=%s seqno=%d "
+                "num_tokens=%d aux_rows=%d inflight=%d queued=%d",
+                fields.connection,
+                key[1].value,
                 fields.seqno,
                 fields.num_tokens,
                 fields.aux_rows,
@@ -402,44 +582,60 @@ class LwdCloudWorker(LwdWorkerBase):
             )
 
     def _report_irecv_completions(self) -> None:
-        """Publish staged arrivals in seqno order and report cumulative rows."""
-        done_mq = self._irecv_done_mq
+        """Publish each connection's contiguous completion prefix independently."""
         stager = self._lwd_stager
-        if done_mq is None or stager is None:
+        if stager is None:
             return
         with self._early_recv_lock:
-            pending = list(self._early_recv_futures.items())
+            pending = sorted(self._early_recv_futures.items(), key=lambda item: (item[0][0], item[0][2]))
+        blocked: set[ConnectionId] = set()
         for key, future in pending:
-            if not future.done():
-                break
-            self._early_recv_current_seqno = key[1]
-            future.result()
-            if not future.staged_done():
-                self._early_recv_current_seqno = -1
-                break
-            future.result()
+            connection, channel, seqno = key
+            if connection in blocked or connection in self._early_recv_failed_connections:
+                continue
+            done_mq = self._irecv_done_mqs.get(connection)
+            self._early_recv_current_key = key
             try:
-                published = stager.publish_received(key[1])
-                stager.release_if_drained(key[1])
+                if done_mq is None:
+                    # No report reader for this connection: leave the future
+                    # queued (aligned with the memc baseline; no consume-point
+                    # fallback recycling).
+                    blocked.add(connection)
+                    continue
+                if not future.done():
+                    blocked.add(connection)
+                    continue
+                future.result()
+                if not future.staged_done():
+                    blocked.add(connection)
+                    continue
+                future.result()
+                stage_key = (connection, seqno)
+                published = stager.publish_received(stage_key)
+                stager.release_if_drained(stage_key)
                 arrived = [(req_id, offset + rows) for req_id, rows, offset in published]
                 future.release_device_tensor()
-                for req_id, prefix_nonce in stager.take_refill_done():
-                    done_mq.enqueue(("refill_done", req_id, prefix_nonce))
+                for req_id, nonce in stager.take_refill_done(connection):
+                    done_mq.enqueue(("refill_done", req_id, nonce))
                 done_mq.enqueue((key, arrived))
-            except Exception:
-                stager.abandon(key[1])
-                raise
+            except Exception as exc:
+                self._lwd_fail_early_recv_connection(connection, seqno, exc)
+                blocked.add(connection)
+                continue
+            finally:
+                self._early_recv_current_key = None
             with self._early_recv_lock:
                 self._early_recv_futures.pop(key, None)
-                self._early_recv_last_delivered = key[1]
-            self._early_recv_current_seqno = -1
+                self._early_recv_last_delivered[connection] = seqno
+            self._early_recv_current_key = None
             lwd_logger.info(
-                "[Lwd][pre-recv] REPORT channel=%s seqno=%d arrivals=%s",
-                key[0].value,
-                key[1],
+                "[Lwd][pre-recv] REPORT connection=%s channel=%s seqno=%d arrivals=%s",
+                connection,
+                channel.value,
+                seqno,
                 arrived,
             )
-            self._early_recv_pump()
+        self._early_recv_pump()
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: GrammarOutput) -> ModelRunnerOutput | AsyncModelRunnerOutput:
@@ -447,56 +643,105 @@ class LwdCloudWorker(LwdWorkerBase):
         output = self.model_runner.sample_tokens(grammar_output)
         _t_sample = time.monotonic()
         # rank-replay DOWN: send the hidden packet (channel-async,
-        # in-stream ordered). The executor output thread harvests the device
-        # meta behind the per-step ready event, keeping this worker thread
-        # free to prepare and execute subsequent steps.
-        payload = self.model_runner.take_lwd_pending_down_payload()
-        if payload is not None and output is not None:
-            (hidden, meta_dev, seg_lens_host, ready_event, req_ids) = payload
-            seqno = self._lwd_next_down_seqno()
-            lwd_logger.info(
-                "[Lwd][cloud-worker] DOWN send seqno=%d numel=%d",
-                seqno,
-                hidden.numel(),
-            )
-            lwd_get_data_plane().submit_send(
-                LwdTransferRequest(
-                    channel=LwdChannelType.DOWN,
-                    op="send",
-                    num_elements=hidden.numel(),
-                    dp_idx=self._lwd_dp_idx,
-                    tensor=hidden,
-                    seqno=seqno,
+        # in-stream ordered). The executor output thread harvests each
+        # connection's device meta behind its per-step ready event, keeping
+        # this worker thread free to prepare and execute subsequent steps.
+        payloads = self.model_runner.take_lwd_pending_down_payload()
+        if payloads:
+            from vllm.distributed.parallel_state import get_tp_group
+
+            is_driver = get_tp_group().is_first_rank
+            carriers = []
+            legacy_carrier = None
+            ready_events = {}
+            legacy_ready_event = None
+            for payload in payloads:
+                connection = payload.connection
+                hidden = payload.hidden
+                meta_dev = payload.meta_dev
+                seg_lens_host = payload.seg_lens_host
+                ready_event = payload.ready_event
+                req_ids = payload.req_ids
+                seqno = self._lwd_next_down_seqno(connection)
+                if connection in self._lwd_early_recv_connections:
+                    lwd_logger.info(
+                        "[Lwd][cloud-worker] DOWN send connection=%s seqno=%d numel=%d",
+                        connection,
+                        seqno,
+                        hidden.numel(),
+                    )
+                    lwd_get_data_plane().submit_send(
+                        LwdTransferRequest(
+                            channel=LwdChannelType.DOWN,
+                            op="send",
+                            num_elements=hidden.numel(),
+                            dp_idx=connection.dp_idx,
+                            edge_id=connection.edge_id,
+                            cloud_id=connection.cloud_id,
+                            tensor=hidden,
+                            seqno=seqno,
+                        )
+                    )
+                if not is_driver:
+                    # Every rank advances the same seqno, but only TP0 returns
+                    # C2E metadata through the executor's single output rank.
+                    continue
+                # The device meta and its ready event travel with the output;
+                # the executor output thread owns the fenced D2H harvest.
+                carrier = (meta_dev, seg_lens_host, req_ids, hidden.numel(), seqno, connection)
+                carriers.append(carrier)
+                ready_events[connection] = ready_event
+                if legacy_carrier is None:
+                    legacy_carrier = carrier[:5]
+                    legacy_ready_event = ready_event
+                lwd_logger.info(
+                    "[Lwd][perf] cloud-step connection=%s seqno=%d sample=%.2f send=%.2f total=%.2fms rows=%d",
+                    connection,
+                    seqno,
+                    (_t_sample - _t0) * 1000,
+                    (time.monotonic() - _t_sample) * 1000,
+                    (time.monotonic() - _t0) * 1000,
+                    hidden.shape[0],
                 )
-            )
-            target = getattr(output, "_model_runner_output", output)
-            target.lwd_down_carrier = (
-                meta_dev,
-                seg_lens_host,
-                req_ids,
-                hidden.numel(),
-                seqno,
-            )
-            # The event belongs to this output generation and must be consumed
-            # before the output crosses the process boundary.
-            target.lwd_meta_ready_event = ready_event
-            # [Lwd][perf] Per-step cloud timing: sample = sampling +
-            # collection (rank computation included); send = the DOWN
-            # submit (snapshot clone + isend + bridge wait); total = the
-            # whole step without output-thread meta harvest.
-            lwd_logger.info(
-                "[Lwd][perf] cloud-step seqno=%d sample=%.2f send=%.2f total=%.2fms rows=%d",
-                seqno,
-                (_t_sample - _t0) * 1000,
-                (time.monotonic() - _t_sample) * 1000,
-                (time.monotonic() - _t0) * 1000,
-                hidden.shape[0] if hidden is not None else 0,
-            )
+            if is_driver and output is not None:
+                target = getattr(output, "_model_runner_output", output)
+                target.lwd_down_carriers = carriers
+                target.lwd_down_carrier = legacy_carrier
+                # The events belong to this output generation and must be
+                # consumed before the output crosses the process boundary.
+                target.lwd_meta_ready_events = ready_events
+                target.lwd_meta_ready_event = legacy_ready_event
         return output
 
     # ------------------------------------------------------------------ #
     # LWD housekeeping (control-plane glue)                               #
     # ------------------------------------------------------------------ #
+
+    def shutdown(self) -> None:
+        """Quiesce early receive before closing its data-plane FIFOs."""
+        self._lwd_early_recv_stop.set()
+        thread = self._lwd_early_recv_thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=_LWD_SHUTDOWN_TIMEOUT_S)
+            if thread.is_alive():
+                lwd_logger.warning("[Lwd][pre-recv] comm thread did not stop within %.1fs", _LWD_SHUTDOWN_TIMEOUT_S)
+        try:
+            lwd_get_data_plane().shutdown(timeout=_LWD_SHUTDOWN_TIMEOUT_S)
+            if thread is not None and thread.is_alive():
+                # A blocked HCCL call may outlive this worker. The data plane is
+                # permanently closed against new submissions, but its channels
+                # must remain valid until the process exits and reaps the thread.
+                lwd_logger.warning(
+                    "[Lwd][pre-recv] skip channel destruction while comm thread is alive"
+                )
+            else:
+                from vllm_ascend.distributed.lwd_data_plane.lwd_channels import (
+                    lwd_destroy_channels,
+                )
+
+                lwd_destroy_channels()
+        finally:
+            super().shutdown()
 
     def _lwd_cloud_flush_finished(self, finished_req_ids: list[str]) -> None:
         """Release runner bookkeeping and all host-stage request storage."""
@@ -533,7 +778,9 @@ class LwdCloudWorker(LwdWorkerBase):
 
         AscendSpecDecodeBaseProposer.set_lwd_prompt_embeds_provider(_lwd_prompt_embeds_provider)
 
-    def _lwd_next_down_seqno(self) -> int:
-        seqno = self._lwd_down_next_seqno
-        self._lwd_down_next_seqno += 1
+    def _lwd_next_down_seqno(self, connection: ConnectionId | int = ConnectionId(0, 0, 0)) -> int:
+        if isinstance(connection, int):
+            connection = ConnectionId(0, 0, connection)
+        seqno = self._lwd_down_next_seqno.get(connection, 0)
+        self._lwd_down_next_seqno[connection] = seqno + 1
         return seqno
