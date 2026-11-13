@@ -22,6 +22,17 @@ from typing import Protocol
 
 from vllm.lwd_logger import lwd_logger
 
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId
+
+LwdStageKey = int | tuple[ConnectionId, int]
+
+
+def _stage_sort_key(key: LwdStageKey) -> tuple[int, int, int, int]:
+    if isinstance(key, int):
+        return (0, 0, 0, key)
+    connection, seqno = key
+    return (connection.edge_id, connection.cloud_id, connection.dp_idx, seqno)
+
 
 class LwdBuffer(Protocol):
     def numel(self) -> int: ...
@@ -210,7 +221,7 @@ class LwdReqEmbed:
 class LwdStagedBatch:
     """Request and source-layout metadata for one received batch."""
 
-    seqno: int
+    seqno: LwdStageKey
     req_ids: list[str]
     num_tokens_per_req: list[int]
     hidden_size: int
@@ -248,18 +259,22 @@ class LwdHostStager:
         self._device_factory = device_factory
         self._lock = threading.Lock()
         self._slot_buffers: dict[int, LwdBuffer] = {}
-        self._slot_owner: dict[int, int] = {slot: -1 for slot in range(slots)}
-        self._seqno_slot: dict[int, int] = {}
-        self._batches: dict[int, LwdStagedBatch] = {}
+        self._slot_owner: dict[int, LwdStageKey | int] = {slot: -1 for slot in range(slots)}
+        self._seqno_slot: dict[LwdStageKey, int] = {}
+        self._batches: dict[LwdStageKey, LwdStagedBatch] = {}
         self._reqs: dict[str, LwdReqEmbed] = {}
+        self._req_connections: dict[str, ConnectionId] = {}
         self._ended_req_ids: set[str] = set()
-        self._end_pending: dict[str, set[int]] = {}
-        self._end_after: dict[str, int] = {}
+        self._end_pending: dict[str, set[LwdStageKey]] = {}
+        self._end_after: dict[str, LwdStageKey] = {}
         self._end_waiting: set[str] = set()
-        self._last_delivered = -1
-        self._batch_reqs: dict[int, list[str]] = {}
-        self._arrival_plan: dict[int, list[tuple[LwdReqEmbed, int, int]]] = {}
-        self._refill_done: list[tuple[str, int]] = []
+        self._last_delivered: LwdStageKey = -1
+        self._batch_reqs: dict[LwdStageKey, list[str]] = {}
+        self._arrival_plan: dict[LwdStageKey, list[tuple[LwdReqEmbed, int, int]]] = {}
+        # (connection, req_id, prefix_nonce); connection is None for
+        # single-connection (int) stage keys. Drained per connection so one
+        # edge never consumes another edge's refill completion.
+        self._refill_done: list[tuple[ConnectionId | None, str, int]] = []
         self._host_bytes = 0
         self._released_requests = 0
         self._aborted_requests = 0
@@ -291,9 +306,9 @@ class LwdHostStager:
 
     def busy_slots(self) -> list[int]:
         with self._lock:
-            return [slot for slot, owner in self._slot_owner.items() if owner >= 0]
+            return [slot for slot, owner in self._slot_owner.items() if owner != -1]
 
-    def staged_seqnos(self) -> list[int]:
+    def staged_seqnos(self) -> list[LwdStageKey]:
         with self._lock:
             return list(self._batches)
 
@@ -320,23 +335,26 @@ class LwdHostStager:
             req = self._reqs.get(req_id)
             return req._stage_floor if req is not None else 0
 
-    def take_refill_done(self) -> list[tuple[str, int]]:
+    def take_refill_done(self, connection: ConnectionId | None = None) -> list[tuple[str, int]]:
+        """Drain refill completions of one connection, keeping the rest."""
         with self._lock:
-            done = self._refill_done
-            self._refill_done = []
+            done = [(req_id, nonce) for conn, req_id, nonce in self._refill_done if conn == connection]
+            if done:
+                self._refill_done = [item for item in self._refill_done if item[0] != connection]
         return done
 
-    def allocate(self, seqno: int, numel: int) -> tuple[LwdBuffer, int]:
+    def allocate(self, seqno: LwdStageKey, numel: int) -> tuple[LwdBuffer, int]:
         """Bind a free device slot to one receive sequence number."""
         with self._lock:
             if numel < 0 or (self.max_numel and numel > self.max_numel):
                 raise LwdHostStageGeometryError(f"seqno={seqno}: numel {numel} outside slot capacity {self.max_numel}")
             if seqno in self._seqno_slot:
                 raise LwdHostStageGeometryError(f"seqno={seqno}: receive slot is already allocated")
-            free_slots = [slot for slot, owner in self._slot_owner.items() if owner < 0]
+            free_slots = [slot for slot, owner in self._slot_owner.items() if owner == -1]
             if not free_slots:
                 raise LwdHostStageSlotBusy(
-                    f"seqno={seqno}: all {self.slots} device slot(s) busy (held by seqno={sorted(self._seqno_slot)})"
+                    f"seqno={seqno}: all {self.slots} device slot(s) busy "
+                    f"(held by seqno={sorted(self._seqno_slot, key=_stage_sort_key)})"
                 )
             slot = free_slots[0]
             buf = self._slot_buffers.get(slot)
@@ -347,7 +365,7 @@ class LwdHostStager:
             self._seqno_slot[seqno] = slot
         return buf[:numel], slot
 
-    def abandon(self, seqno: int) -> None:
+    def abandon(self, seqno: LwdStageKey) -> None:
         """Roll back a plan and allocation whose receive was never posted."""
         with self._lock:
             slot = self._seqno_slot.pop(seqno, -1)
@@ -359,15 +377,33 @@ class LwdHostStager:
             self._complete_end_plan(seqno, delivered=False)
             if batch is None:
                 return
+            abandoned_reqs = set(batch.req_ids)
+            self._refill_done = [item for item in self._refill_done if item[1] not in abandoned_reqs]
             for req_id in batch.created_req_ids:
                 req = self._reqs.get(req_id)
                 if req is not None and batch.request_hosts.get(req_id) is req and req._written_hi == req._stage_floor:
                     self._reqs.pop(req_id)
+                    self._req_connections.pop(req_id, None)
                     self._host_bytes -= (req.numel + req.tail_numel) * 2
+
+    def abandon_connection(self, connection: ConnectionId) -> None:
+        """Drop all staged and delivered state owned by one failed peer."""
+        with self._lock:
+            keys = {
+                key
+                for key in (*self._batches.keys(), *self._arrival_plan.keys(), *self._seqno_slot.keys())
+                if isinstance(key, tuple) and key[0] == connection
+            }
+            req_ids = {req_id for key in keys for req_id in self._batch_reqs.get(key, ())}
+            req_ids.update(req_id for req_id, owner in self._req_connections.items() if owner == connection)
+        for key in keys:
+            self.abandon(key)
+        for req_id in req_ids:
+            self.release_request(req_id)
 
     def plan_recv_segments(
         self,
-        seqno: int,
+        seqno: LwdStageKey,
         numel: int,
         hidden_size: int,
         req_ids: list[str],
@@ -420,6 +456,9 @@ class LwdHostStager:
         segments: list[tuple[LwdBuffer, int, int]] = []
         plan: list[tuple[LwdReqEmbed, int, int]] = []
         with self._lock:
+            if isinstance(seqno, tuple):
+                for req_id in req_ids:
+                    self._req_connections.setdefault(req_id, seqno[0])
             source_row = 0
             for index, req_id in enumerate(req_ids):
                 host: LwdReqEmbed | None = None
@@ -453,7 +492,7 @@ class LwdHostStager:
             self._batch_reqs[seqno] = list(req_ids)
             self._arrival_plan[seqno] = plan
         lwd_logger.debug(
-            "[Lwd][host-stage] PLAN seqno=%d dur=%.2fms reqs=%d rows=%d",
+            "[Lwd][host-stage] PLAN seqno=%s dur=%.2fms reqs=%d rows=%d",
             seqno,
             (time.monotonic() - started) * 1000,
             len(req_ids),
@@ -461,8 +500,9 @@ class LwdHostStager:
         )
         return segments
 
-    def publish_received(self, seqno: int) -> list[tuple[str, int, int]]:
+    def publish_received(self, seqno: LwdStageKey) -> list[tuple[str, int, int]]:
         """Publish active D2H arrivals and release the receive slot."""
+        connection = seqno[0] if isinstance(seqno, tuple) else None
         with self._lock:
             plan = self._arrival_plan.pop(seqno, None)
             if plan is None:
@@ -478,16 +518,17 @@ class LwdHostStager:
                     host._refill_lo = None
                     host._refill_hi = None
                     host._refill_completed = False
-                    self._refill_done.append((host.req_id, host.prefix_nonce))
+                    self._refill_done.append((connection, host.req_id, host.prefix_nonce))
                 rows.append((host.req_id, n_rows, dest_row))
             slot = self._seqno_slot.pop(seqno, -1)
             if slot >= 0:
                 self._slot_owner[slot] = -1
-            self._last_delivered = max(self._last_delivered, seqno)
+            if self._last_delivered == -1 or _stage_sort_key(seqno) > _stage_sort_key(self._last_delivered):
+                self._last_delivered = seqno
             self._complete_end_plan(seqno, delivered=True)
         return rows
 
-    def batch(self, seqno: int) -> LwdStagedBatch | None:
+    def batch(self, seqno: LwdStageKey) -> LwdStagedBatch | None:
         with self._lock:
             return self._batches.get(seqno)
 
@@ -527,6 +568,7 @@ class LwdHostStager:
         """Freeze a request and guard its old plans until they drain."""
         with self._lock:
             req = self._reqs.get(req_id)
+            self._refill_done = [item for item in self._refill_done if item[1] != req_id]
             self._retire_request(req_id, wait_for_plan=req is None)
             if req is None:
                 return False
@@ -540,6 +582,8 @@ class LwdHostStager:
         """Release host storage and guard only its unpublished old plans."""
         with self._lock:
             req = self._reqs.pop(req_id, None)
+            self._req_connections.pop(req_id, None)
+            self._refill_done = [item for item in self._refill_done if item[1] != req_id]
             if req is not None or req_id in self._ended_req_ids:
                 self._retire_request(req_id, wait_for_plan=False)
             if req is None:
@@ -549,7 +593,7 @@ class LwdHostStager:
             self._released_requests += 1
         return freed
 
-    def release_if_drained(self, seqno: int) -> bool:
+    def release_if_drained(self, seqno: LwdStageKey) -> bool:
         """Drop published batch metadata after its generation's hosts are released."""
         with self._lock:
             if seqno in self._arrival_plan:
@@ -563,7 +607,7 @@ class LwdHostStager:
             self._batches.pop(seqno, None)
             return True
 
-    def batches_holding(self, req_id: str) -> list[int]:
+    def batches_holding(self, req_id: str) -> list[LwdStageKey]:
         with self._lock:
             return [seqno for seqno, req_ids in self._batch_reqs.items() if req_id in req_ids]
 
@@ -574,20 +618,27 @@ class LwdHostStager:
         if pending:
             self._ended_req_ids.add(req_id)
             self._end_pending[req_id] = pending
-            self._end_after[req_id] = max(pending)
+            self._end_after[req_id] = max(pending, key=_stage_sort_key)
         elif wait_for_plan:
             self._ended_req_ids.add(req_id)
             self._end_pending[req_id] = set()
             self._end_after[req_id] = self._last_delivered
             self._end_waiting.add(req_id)
 
-    def _complete_end_plan(self, seqno: int, delivered: bool) -> None:
+    def _complete_end_plan(self, seqno: LwdStageKey, delivered: bool) -> None:
         for pending in self._end_pending.values():
             pending.discard(seqno)
         for req_id in list(self._ended_req_ids):
-            if req_id in self._end_waiting or self._end_pending.get(req_id):
+            if req_id in self._end_waiting:
+                # An abort that raced ahead of the first hint stays guarded
+                # only until that request's first plan completes/abandons.
+                # Unrelated batches must not release the tombstone.
+                if req_id not in self._batch_reqs.get(seqno, ()):
+                    continue
+                self._end_waiting.discard(req_id)
+            if self._end_pending.get(req_id):
                 continue
-            if delivered and self._last_delivered < self._end_after[req_id]:
+            if delivered and _stage_sort_key(self._last_delivered) < _stage_sort_key(self._end_after[req_id]):
                 continue
             self._ended_req_ids.discard(req_id)
             self._end_pending.pop(req_id, None)
@@ -595,7 +646,7 @@ class LwdHostStager:
 
     def _validate_plan(
         self,
-        seqno: int,
+        seqno: LwdStageKey,
         numel: int,
         hidden_size: int,
         req_ids: list[str],

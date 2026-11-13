@@ -113,7 +113,7 @@ def test_pinned_staging_single_implementation() -> None:
     base = (_REPO_ROOT / "vllm_ascend/worker/lwd_base_model/lwd_base_model_runner.py").read_text(encoding="utf-8")
     assert base.count("LwdPinnedStaging(") == 1  # the named lazy factory is the sole constructor
     assert runner.count("LwdPinnedStaging(") == 0  # the cloud delegates via _lwd_staging
-    assert runner.count("self._lwd_staging(") == 1  # down_index only; meta harvest lives on the worker
+    assert runner.count("self._lwd_staging(") == 1  # down_index only; meta harvest lives on the output thread
     assert '"down_index"' in runner
     assert '"down_meta"' not in runner
     assert edge.count("LwdPinnedStaging(") == 0  # the edge worker is pure dispatch
@@ -193,16 +193,16 @@ def test_meta_ready_handoff_to_output_thread() -> None:
     collect = _segment(_RUNNER, "_lwd_collect_down_payload")
     assert "ready_event = torch.npu.Event()" in collect
     assert "ready_event.record()" in collect
-    # The worker only hands the device meta and its per-step event to the
-    # executor output thread; it must not block the compute critical path.
+    # The worker only hands the device meta and per-connection ready events
+    # to the executor output thread; it must not block the compute path.
     assert "stream.wait_event(ready_event)" not in worker
     assert "done.synchronize()" not in worker
-    carrier = worker.index("target.lwd_down_carrier = (")
-    event = worker.index("target.lwd_meta_ready_event = ready_event")
-    handoff = worker[carrier:event]
-    for field in ("meta_dev", "seg_lens_host", "req_ids", "hidden.numel()", "seqno"):
-        assert field in handoff
-    assert carrier < event
+    device = worker.index(
+        "carrier = (meta_dev, seg_lens_host, req_ids, hidden.numel(), seqno, connection)"
+    )
+    carrier = worker.index("target.lwd_down_carriers = carriers")
+    event = worker.index("target.lwd_meta_ready_events = ready_events")
+    assert device < carrier < event
 
 
 def test_collect_split_and_payload_protocol() -> None:
@@ -212,12 +212,12 @@ def test_collect_split_and_payload_protocol() -> None:
         assert f"self.{helper}(" in _segment(_RUNNER, "_lwd_collect_down_payload")
     assert "def _lwd_stage_down_meta(" not in src
     orch = _segment(_RUNNER, "_lwd_collect_down_payload")
-    payload = orch[orch.rindex("return (") :]
-    # Payload: (hidden, device meta, host segment lengths, ready event,
-    # req_ids), with req_ids filtered by the captured snapshot mask.
+    payload = orch[orch.rindex("payloads.append(") :]
+    # Per-connection payload: (hidden, device meta, host segment lengths,
+    # ready event, req_ids), with req_ids filtered by the connection's mask.
     for field in ("hidden_packet", "meta_dev", "seg_lens_host", "ready_event"):
         assert field in payload
-    assert "[r for i, r in enumerate(batch_req_ids) if valid[i]]" in payload
+    assert "[r for i, r in enumerate(batch_req_ids) if group_valid[i]]" in payload
 
 
 def test_finished_release_single_owner() -> None:

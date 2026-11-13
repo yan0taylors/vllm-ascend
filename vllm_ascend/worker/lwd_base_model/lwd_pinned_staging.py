@@ -41,38 +41,62 @@ class LwdPinnedStaging:
         self._device = device
         self._pinned_slots: list[torch.Tensor] | None = None
         self._device_slots: list[torch.Tensor] | None = None
+        self._slot_events: list[object | None] = []
         self._index = 0
 
-    def _ensure(self, n: int) -> None:
+    def _ensure(self, n: int, min_depth: int | None = None) -> None:
+        depth = max(self._depth, min_depth or 0)
         if self._pinned_slots is not None and self._pinned_slots[0].numel() >= n:
+            while len(self._pinned_slots) < depth:
+                capacity = self._pinned_slots[0].numel()
+                self._pinned_slots.append(torch.empty(capacity, dtype=self._dtype, pin_memory=True))
+                if self._device_slots is not None:
+                    self._device_slots.append(torch.empty(capacity, dtype=self._dtype, device=self._device))
+                self._slot_events.append(None)
             return
+        for event in self._slot_events:
+            if event is not None:
+                event.synchronize()
         capacity = max(n, self._min_capacity)
-        self._pinned_slots = [torch.empty(capacity, dtype=self._dtype, pin_memory=True) for _ in range(self._depth)]
+        self._pinned_slots = [torch.empty(capacity, dtype=self._dtype, pin_memory=True) for _ in range(depth)]
         self._device_slots = (
             None
             if self._device is None
-            else [torch.empty(capacity, dtype=self._dtype, device=self._device) for _ in range(self._depth)]
+            else [torch.empty(capacity, dtype=self._dtype, device=self._device) for _ in range(depth)]
         )
+        self._slot_events = [None] * depth
         self._index = 0
 
     def _rotate(self) -> int:
         index = self._index
-        self._index = (index + 1) % self._depth
+        self._index = (index + 1) % len(self._pinned_slots)
         return index
 
-    def stage_to_device(self, src: Sequence[int] | np.ndarray, n: int) -> torch.Tensor:
+    def stage_to_device(
+        self,
+        src: Sequence[int] | np.ndarray,
+        n: int,
+        min_depth: int | None = None,
+    ) -> torch.Tensor:
         """Stage ``src`` and issue an async H2D; return the ``[:n]`` device view.
 
         Same-stream ordering guarantees the consumer kernel reads this
         step's values (H2D enqueued before the consumer), matching the
         retired inline staging loops.
         """
-        self._ensure(n)
+        self._ensure(n, min_depth)
         index = self._rotate()
+        previous = self._slot_events[index]
+        if previous is not None:
+            previous.synchronize()
         stage = self._pinned_slots[index]
         stage.numpy()[:n] = src
         device = self._device_slots[index]
         device[:n].copy_(stage[:n], non_blocking=True)
+        accelerator = torch.npu if str(self._device).startswith("npu") else torch.cuda
+        event = accelerator.Event()
+        event.record()
+        self._slot_events[index] = event
         return device[:n]
 
     def next_pinned(self, n: int) -> torch.Tensor:
