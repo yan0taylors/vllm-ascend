@@ -239,6 +239,10 @@ class LwdCloudWorker(LwdWorkerBase):
         self._irecv_done_mqs: dict[ConnectionId, Any] = {}
         self._lwd_early_recv_thread: threading.Thread | None = None
         self._lwd_early_recv_stop = threading.Event()
+        # [azy] Throttled-timestamp state for early-recv diagnostics
+        # (1117 2E2C TTFT investigation); remove with the investigation.
+        self._azy_snap_ts = 0.0
+        self._azy_slotbusy_ts = 0.0
 
     def _lwd_build_up_recv_request(
         self,
@@ -329,6 +333,22 @@ class LwdCloudWorker(LwdWorkerBase):
         )
         hint_mqs = {connection: mq for connection, mq in self._irecv_hint_mqs.items() if mq is not None}
         while not self._lwd_early_recv_stop.is_set():
+            # [azy] Throttled pipeline snapshot: queued > 0 with inflight at
+            # the cap means the receive pipeline, not the edge, is the
+            # pacing limiter; a stalled snapshot (all zero) means no hints.
+            now = time.monotonic()
+            if now - self._azy_snap_ts >= 5.0:
+                self._azy_snap_ts = now
+                with self._early_recv_lock:
+                    inflight = len(self._early_recv_futures) + len(self._early_recv_reserved)
+                    queued = len(self._early_recv_pending)
+                lwd_logger.info(
+                    "[LWD][azy] early-recv snapshot inflight=%d/%d queued=%d failed=%d",
+                    inflight,
+                    self._early_recv_max_inflight,
+                    queued,
+                    len(self._early_recv_failed_connections),
+                )
             for connection, hint_mq in hint_mqs.items():
                 if connection in self._early_recv_failed_connections:
                     continue
@@ -530,6 +550,16 @@ class LwdCloudWorker(LwdWorkerBase):
                         self._early_recv_pending[key] = hint
                     if self._early_recv_current_key == key:
                         self._early_recv_current_key = None
+                # [azy] All device receive slots are owned; throttled so a
+                # saturated pipeline does not spam the log.
+                now = time.monotonic()
+                if now - self._azy_slotbusy_ts >= 1.0:
+                    self._azy_slotbusy_ts = now
+                    lwd_logger.warning(
+                        "[LWD][azy] host-stage slots busy conn=%s pending=%d",
+                        fields.connection,
+                        len(self._early_recv_pending),
+                    )
                 blocked.add(fields.connection)
                 continue
             except Exception as exc:
