@@ -337,7 +337,7 @@ class LwdCloudWorker(LwdWorkerBase):
             # the cap means the receive pipeline, not the edge, is the
             # pacing limiter; a stalled snapshot (all zero) means no hints.
             now = time.monotonic()
-            if now - self._azy_snap_ts >= 5.0:
+            if now - self._azy_snap_ts >= 10.0:
                 self._azy_snap_ts = now
                 with self._early_recv_lock:
                     inflight = len(self._early_recv_futures) + len(self._early_recv_reserved)
